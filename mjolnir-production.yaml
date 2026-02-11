@@ -1,0 +1,22 @@
+# Mjolnir config template. Replace accessToken and managementRoom after running setup-mjolnir.sh.
+# Setup script seds example.com and matrix.example.com to your SERVER_NAME and MATRIX_DOMAIN.
+homeserverUrl: "https://matrix.example.com"
+rawHomeserverUrl: "https://matrix.example.com"
+accessToken: "REPLACE_AFTER_SETUP"
+managementRoom: "!REPLACE:example.com"
+# Set use: true and username/password if the management room is encrypted (E2EE).
+encryption:
+  use: false
+  # username: mjolnir
+  # password: "your-mjolnir-password"
+dataPath: "/data/storage"
+autojoinOnlyIfManager: true
+verboseLogging: false
+logLevel: "INFO"
+syncOnStartup: true
+verifyPermissionsOnStartup: true
+noop: false
+commands:
+  allowNoPrefix: false
+  confirmWildcardBan: true
+protectAllJoinedRooms: false

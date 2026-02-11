@@ -1,0 +1,31 @@
+# Optional recording rules for Synapse dashboards (e.g. federation panels).
+# Include in Prometheus rule_files. From Synapse contrib/prometheus/synapse-v2.rules.
+---
+groups:
+  - name: synapse_federation
+    interval: 1m
+    rules:
+      - record: synapse_federation_client_sent
+        labels: { type: "EDU" }
+        expr: synapse_federation_client_sent_edus_total + 0
+      - record: synapse_federation_client_sent
+        labels: { type: "PDU" }
+        expr: synapse_federation_client_sent_pdu_destinations_count_total + 0
+      - record: synapse_federation_client_sent
+        labels: { type: "Query" }
+        expr: sum(synapse_federation_client_sent_queries) by (job)
+      - record: synapse_federation_server_received
+        labels: { type: "EDU" }
+        expr: synapse_federation_server_received_edus_total + 0
+      - record: synapse_federation_server_received
+        labels: { type: "PDU" }
+        expr: synapse_federation_server_received_pdus_total + 0
+      - record: synapse_federation_server_received
+        labels: { type: "Query" }
+        expr: sum(synapse_federation_server_received_queries) by (job)
+      - record: synapse_federation_transaction_queue_pending
+        labels: { type: "EDU" }
+        expr: synapse_federation_transaction_queue_pending_edus + 0
+      - record: synapse_federation_transaction_queue_pending
+        labels: { type: "PDU" }
+        expr: synapse_federation_transaction_queue_pending_pdus + 0

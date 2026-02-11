@@ -1,0 +1,6 @@
+# Add to Synapse so it loads the Discord bridge registration.
+# Copy to /etc/matrix-synapse/conf.d/ (e.g. 50-appservice-discord.yaml) only AFTER
+# you have generated discord-registration.yaml and placed it at /etc/matrix-synapse/discord-registration.yaml.
+# Then restart Synapse: sudo systemctl restart matrix-synapse.
+app_service_config_files:
+  - /etc/matrix-synapse/discord-registration.yaml

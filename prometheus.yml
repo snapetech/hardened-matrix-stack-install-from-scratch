@@ -1,0 +1,13 @@
+# Prometheus config template for Matrix stack.
+# Scrape Synapse metrics only. Place in /opt/prometheus/prometheus.yml (or container mount).
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: synapse
+    metrics_path: /_synapse/metrics
+    static_configs:
+      - targets: ['127.0.0.1:9000']
+        labels:
+          instance: matrix

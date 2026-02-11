@@ -1,0 +1,19 @@
+# URL preview: SSRF risk. Safer default = disabled.
+# Add to /etc/matrix-synapse/conf.d/ (e.g. 45-url-preview.yaml).
+# Ref: https://matrix-org.github.io/synapse/latest/usage/configuration/config_documentation.html
+url_preview_enabled: false
+
+# If you enable preview, uncomment and keep the blacklist so Synapse cannot fetch internal IPs:
+# url_preview_enabled: true
+# url_preview_ip_range_blacklist:
+#   - '127.0.0.0/8'
+#   - '10.0.0.0/8'
+#   - '172.16.0.0/12'
+#   - '192.168.0.0/16'
+#   - '100.64.0.0/10'
+#   - '169.254.0.0/16'
+#   - '::1/128'
+#   - 'fe80::/10'
+#   - 'fc00::/7'
+#   - 'ff00::/8'
+# max_spider_size: 8M

@@ -1,0 +1,41 @@
+# Element Call / MatrixRTC backend: LiveKit SFU + lk-jwt-service.
+# Generated/used by setup-from-scratch.sh. Requires .env with LIVEKIT_KEY, LIVEKIT_SECRET,
+# and livekit.yaml with matching keys. MATRIX_DOMAIN and LIVEKIT_JWT_URL are set by the script.
+networks:
+  ecbackend:
+    driver: bridge
+
+services:
+  livekit:
+    image: livekit/livekit-server:v1.9.4
+    pull_policy: always
+    hostname: livekit-sfu
+    command: --config /etc/livekit.yaml
+    restart: unless-stopped
+    ports:
+      - "7880:7880/tcp"
+      - "7881:7881/tcp"
+      - "7882:7882/tcp"
+      - "50000-50200:50000-50200/udp"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    networks:
+      - ecbackend
+
+  auth-service:
+    image: ghcr.io/element-hq/lk-jwt-service:latest
+    pull_policy: always
+    hostname: auth-server
+    environment:
+      - LIVEKIT_JWT_PORT=6080
+      - LIVEKIT_URL=wss://MATRIX_RTC_HOST/livekit/sfu
+      - LIVEKIT_KEY=${LIVEKIT_KEY}
+      - LIVEKIT_SECRET=${LIVEKIT_SECRET}
+      - LIVEKIT_FULL_ACCESS_HOMESERVERS=*
+    deploy:
+      restart_policy:
+        condition: on-failure
+    ports:
+      - "6080:6080"
+    networks:
+      - ecbackend

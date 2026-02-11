@@ -1,0 +1,9 @@
+# LiveKit server config. setup-from-scratch.sh copies this to livekit.yaml and substitutes LIVEKIT_KEY/LIVEKIT_SECRET.
+port: 7880
+rtc:
+  port_range_start: 50000
+  port_range_end: 50200
+  tcp_port: 7881
+  use_external_ip: true
+keys:
+  LIVEKIT_KEY_PLACEHOLDER: "LIVEKIT_SECRET_PLACEHOLDER"

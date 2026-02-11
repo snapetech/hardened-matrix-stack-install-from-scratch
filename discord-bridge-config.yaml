@@ -1,0 +1,22 @@
+# matrix-appservice-discord config. Setup script seds example.com / matrix.example.com to your SERVER_NAME / MATRIX_DOMAIN.
+# 1) Create a Discord application at https://discord.com/developers/applications, create a Bot, copy bot token.
+# 2) Generate registration: run `yarn start -r -u "http://127.0.0.1:9005"` (or the URL Synapse will use). Copy output to /etc/matrix-synapse/discord-registration.yaml and add to Synapse app_service_config_files.
+# 3) Fill auth.botToken and auth.clientID below, then run the bridge (Docker or yarn start).
+# Database paths: use /data/... when running in Docker (mount /opt/discord-bridge as /data).
+bridge:
+  domain: "example.com"
+  homeserverUrl: "https://matrix.example.com"
+  port: 9005
+  adminMxid: "@admin:example.com"
+auth:
+  clientID: "YOUR_DISCORD_APP_CLIENT_ID"
+  botToken: "YOUR_DISCORD_BOT_TOKEN"
+  usePrivilegedIntents: false
+logging:
+  console: "info"
+database:
+  filename: "/data/discord.db"
+room:
+  defaultVisibility: "private"
+channel:
+  namePattern: "[Discord] :guild :name"

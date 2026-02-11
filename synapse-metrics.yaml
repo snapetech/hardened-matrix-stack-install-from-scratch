@@ -1,0 +1,19 @@
+# Enable Prometheus metrics and expose on dedicated port (localhost only).
+# Add to /etc/matrix-synapse/conf.d/ then: sudo systemctl restart matrix-synapse
+# Prometheus scrapes http://127.0.0.1:9000/_synapse/metrics
+#
+# Listener: client only (no federation). For federating, change names to [client, federation].
+# Ref: NO-FEDERATION-RUNBOOK.md, Synapse reverse proxy docs.
+enable_metrics: true
+listeners:
+  - bind_addresses: ['127.0.0.1', '::1']
+    port: 8008
+    type: http
+    tls: false
+    x_forwarded: true
+    resources:
+      - names: [client]
+        compress: false
+  - port: 9000
+    type: metrics
+    bind_addresses: ['127.0.0.1', '::1']

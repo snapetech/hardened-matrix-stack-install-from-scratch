@@ -1,0 +1,8 @@
+# No-federation topology: belt-and-suspenders at the app layer.
+# Add to /etc/matrix-synapse/conf.d/ (e.g. 44-no-federation.yaml).
+# Ref: https://matrix-org.github.io/synapse/latest/usage/configuration/config_documentation.html
+#
+# Also ensure: listener uses resources: names: [client] only (no federation).
+# If you do not use registration, remove registration_shared_secret from config
+# (it can allow account creation even when enable_registration: false).
+federation_domain_whitelist: []

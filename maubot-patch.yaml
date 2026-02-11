@@ -1,0 +1,8 @@
+# Append / merge into maubot config.yaml on server. Setup script seds example.com / matrix.example.com to your SERVER_NAME / MATRIX_DOMAIN.
+# Add homeserver and set public_url. Then add a client via UI (or mbc auth) with @maubot:your-domain (create that user first via Admin API).
+homeservers:
+  example.com:
+    url: https://matrix.example.com
+    secret: null
+server:
+  public_url: https://matrix.example.com

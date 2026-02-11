@@ -1,0 +1,15 @@
+[Unit]
+Description=Metrics auth proxy (Synapse login gate for Prometheus)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/metrics-auth/metrics-auth-proxy.py
+Environment=SYNAPSE_URL=https://matrix.example.com
+Environment=LISTEN=127.0.0.1:9091
+WorkingDirectory=/opt/metrics-auth
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

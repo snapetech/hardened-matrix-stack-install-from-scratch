@@ -1,0 +1,21 @@
+# Listener: client only (no federation). Use this when not federating.
+# Replaces or overrides the listener that had resources: [client, federation].
+# Add to /etc/matrix-synapse/conf.d/ (e.g. 99-synapse-metrics.yaml — change
+# names: [client, federation] to names: [client] and keep the metrics listener).
+# Ref: https://matrix-org.github.io/synapse/latest/reverse_proxy.html
+#
+# This file shows the target shape; merge into your existing listener block so
+# you have one HTTP listener on 8008 (client only) and one metrics listener on 9000.
+enable_metrics: true
+listeners:
+  - port: 8008
+    type: http
+    tls: false
+    bind_addresses: ['127.0.0.1', '::1']
+    x_forwarded: true
+    resources:
+      - names: [client]
+        compress: false
+  - port: 9000
+    type: metrics
+    bind_addresses: ['127.0.0.1', '::1']
