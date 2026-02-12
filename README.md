@@ -52,9 +52,21 @@ The script prompts for:
 11. **Maubot (optional):** Creates `@maubot:SERVER_NAME`; writes `/opt/maubot/config.yaml`. You run Maubot (pip or Docker) yourself.
 12. **Discord bridge (optional):** Writes `/opt/discord-bridge/config.yaml`; if `npx` is available, generates registration and adds Synapse appservice config; you start the bridge (Node or Docker).
 
+## Non-interactive / QA
+
+For automation or QA (e.g. in a Debian VM), use non-interactive mode and optional self-signed TLS:
+
+```bash
+# On a Debian/Ubuntu host or VM (must have systemd: PostgreSQL, nginx, Synapse start via systemctl)
+sudo -E ./run-qa-noninteractive.sh
+```
+
+Defaults: `MATRIX_DOMAIN=matrix.qa.local`, `SERVER_NAME=qa.local`, `USE_SELF_SIGNED_CERT=1`. Override with env vars (see script). Set `ADMIN_PASSWORD` to create the first admin user without a prompt. Full installation requires a real Debian/Ubuntu system (or VM) with systemd; the script will fail in a minimal container without running PostgreSQL/nginx.
+
 ## Contents of this repo
 
 - **setup-from-scratch.sh** — Main script (run as root).
+- **run-qa-noninteractive.sh** — Wrapper for non-interactive/QA (sets `NON_INTERACTIVE=1`, `USE_SELF_SIGNED_CERT=1`, runs setup-from-scratch.sh).
 - **SETUP-FROM-SCRATCH.md** — Detailed setup and prompts.
 - **backup-matrix.sh** — Backup script (Synapse DB, media, conf.d, server config including Element Call, Mjolnir, Maubot, Discord).
 - **element-call/** — `docker-compose.yml` and `livekit.yaml.template` for Element Call / LiveKit.

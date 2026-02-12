@@ -7,34 +7,37 @@
 #
 # Usage: sudo ./setup-from-scratch.sh
 #    or: copy this repo to the server and run from the repo root.
+# Non-interactive (QA / automation): set NON_INTERACTIVE=1 and env vars (MATRIX_DOMAIN,
+# SERVER_NAME, ROOT_DOMAIN, LE_EMAIL, FEDERATION, INSTALL_*). Use USE_SELF_SIGNED_CERT=1
+# to skip Let's Encrypt and use a self-signed cert (e.g. when no real DNS).
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Where to find config templates (same dir as this script)
 REPO_DIR="${REPO_DIR:-$SCRIPT_DIR}"
 
-# --- Defaults (overridden by prompts) ---
-MATRIX_DOMAIN=""
-SERVER_NAME=""
-ROOT_DOMAIN=""          # For .well-known (often same as SERVER_NAME)
-LE_EMAIL=""
-FEDERATION="n"
-INSTALL_COTURN="y"
-INSTALL_MONITORING="y"
-INSTALL_ELEMENT_CALL="n"
-INSTALL_FAIL2BAN="y"
-INSTALL_BACKUP_CRON="y"
-INSTALL_MJOLNIR="n"
-INSTALL_MAUBOT="n"
-INSTALL_DISCORD="n"
-INSTALL_METRICS_AUTH="y"   # When monitoring is installed, gate metrics behind Synapse login
+# --- Defaults (overridden by prompts or env when NON_INTERACTIVE=1) ---
+MATRIX_DOMAIN="${MATRIX_DOMAIN:-}"
+SERVER_NAME="${SERVER_NAME:-}"
+ROOT_DOMAIN="${ROOT_DOMAIN:-}"
+LE_EMAIL="${LE_EMAIL:-}"
+FEDERATION="${FEDERATION:-n}"
+INSTALL_COTURN="${INSTALL_COTURN:-y}"
+INSTALL_MONITORING="${INSTALL_MONITORING:-y}"
+INSTALL_ELEMENT_CALL="${INSTALL_ELEMENT_CALL:-n}"
+INSTALL_FAIL2BAN="${INSTALL_FAIL2BAN:-y}"
+INSTALL_BACKUP_CRON="${INSTALL_BACKUP_CRON:-y}"
+INSTALL_MJOLNIR="${INSTALL_MJOLNIR:-n}"
+INSTALL_MAUBOT="${INSTALL_MAUBOT:-n}"
+INSTALL_DISCORD="${INSTALL_DISCORD:-n}"
+INSTALL_METRICS_AUTH="${INSTALL_METRICS_AUTH:-y}"
+ADMIN_USER="${ADMIN_USER:-admin}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 
 # --- State ---
 SYNAPSE_DB_PASSWORD=""
 TURN_SECRET=""
 REGISTRATION_SHARED_SECRET=""
-ADMIN_USER=""
-ADMIN_PASSWORD=""       # Used for Mjolnir/Maubot bot creation if provided
 LIVEKIT_KEY=""
 LIVEKIT_SECRET=""
 DISCORD_BOT_TOKEN=""
@@ -53,39 +56,52 @@ run_prompts() {
     die "Run as root or with sudo."
   fi
 
-  # Matrix client URL (what users type in Element)
-  prompt MATRIX_DOMAIN "matrix.example.com" "Matrix client URL (hostname only, e.g. matrix.example.com):"
-  # MXID domain (@user:example.com)
-  prompt SERVER_NAME "example.com" "Matrix server name for MXIDs (e.g. example.com):"
-  # Root domain for .well-known (often same as SERVER_NAME)
-  ROOT_DOMAIN="${ROOT_DOMAIN:-$SERVER_NAME}"
-  prompt ROOT_DOMAIN "$SERVER_NAME" "Root domain for .well-known discovery (usually same as server name):"
-  prompt LE_EMAIL "admin@$SERVER_NAME" "Email for Let's Encrypt (cert expiry notices):"
-  yesno FEDERATION "n" "Enable federation (open to other Matrix servers)?"
-  yesno INSTALL_COTURN "y" "Install coturn (TURN/STUN for voice/video)?"
-  yesno INSTALL_MONITORING "y" "Install Prometheus + Grafana (metrics)?"
-  yesno INSTALL_ELEMENT_CALL "n" "Install Element Call / LiveKit (Docker)?"
-  yesno INSTALL_FAIL2BAN "y" "Install fail2ban (login brute-force protection)?"
-  yesno INSTALL_BACKUP_CRON "y" "Install backup script and daily cron?"
-  yesno INSTALL_MJOLNIR "n" "Install Mjolnir (moderation bot, Docker)?"
-  yesno INSTALL_MAUBOT "n" "Install Maubot (plugin bot)?"
-  yesno INSTALL_DISCORD "n" "Install Discord bridge (appservice)?"
-  if [ "$INSTALL_MONITORING" = "y" ]; then
-    yesno INSTALL_METRICS_AUTH "y" "Gate Prometheus/Grafana behind Synapse login (metrics-auth proxy)?"
-  fi
-  read -p "First admin Matrix user (localpart, e.g. admin) [admin]: " ADMIN_USER
-  ADMIN_USER="${ADMIN_USER:-admin}"
+  if [ "${NON_INTERACTIVE:-0}" = "1" ]; then
+    # Non-interactive: require minimal env and apply defaults
+    MATRIX_DOMAIN="${MATRIX_DOMAIN:-matrix.example.com}"
+    SERVER_NAME="${SERVER_NAME:-example.com}"
+    ROOT_DOMAIN="${ROOT_DOMAIN:-$SERVER_NAME}"
+    LE_EMAIL="${LE_EMAIL:-admin@$SERVER_NAME}"
+    for v in FEDERATION INSTALL_COTURN INSTALL_MONITORING INSTALL_ELEMENT_CALL INSTALL_FAIL2BAN INSTALL_BACKUP_CRON INSTALL_MJOLNIR INSTALL_MAUBOT INSTALL_DISCORD INSTALL_METRICS_AUTH; do
+      eval "val=\$$v"; val="$(echo "${val:-}" | tr '[:upper:]' '[:lower:]')"
+      case "$val" in ""|y|yes|1|true) eval "$v=y" ;; *) eval "$v=n" ;; esac
+    done
+    [ "$INSTALL_MONITORING" != "y" ] && INSTALL_METRICS_AUTH="n"
+    ADMIN_USER="${ADMIN_USER:-admin}"
+    echo "  (NON_INTERACTIVE=1: using MATRIX_DOMAIN=$MATRIX_DOMAIN SERVER_NAME=$SERVER_NAME)"
+  else
+    # Interactive prompts
+    prompt MATRIX_DOMAIN "matrix.example.com" "Matrix client URL (hostname only, e.g. matrix.example.com):"
+    prompt SERVER_NAME "example.com" "Matrix server name for MXIDs (e.g. example.com):"
+    ROOT_DOMAIN="${ROOT_DOMAIN:-$SERVER_NAME}"
+    prompt ROOT_DOMAIN "$SERVER_NAME" "Root domain for .well-known discovery (usually same as server name):"
+    prompt LE_EMAIL "admin@$SERVER_NAME" "Email for Let's Encrypt (cert expiry notices):"
+    yesno FEDERATION "n" "Enable federation (open to other Matrix servers)?"
+    yesno INSTALL_COTURN "y" "Install coturn (TURN/STUN for voice/video)?"
+    yesno INSTALL_MONITORING "y" "Install Prometheus + Grafana (metrics)?"
+    yesno INSTALL_ELEMENT_CALL "n" "Install Element Call / LiveKit (Docker)?"
+    yesno INSTALL_FAIL2BAN "y" "Install fail2ban (login brute-force protection)?"
+    yesno INSTALL_BACKUP_CRON "y" "Install backup script and daily cron?"
+    yesno INSTALL_MJOLNIR "n" "Install Mjolnir (moderation bot, Docker)?"
+    yesno INSTALL_MAUBOT "n" "Install Maubot (plugin bot)?"
+    yesno INSTALL_DISCORD "n" "Install Discord bridge (appservice)?"
+    if [ "$INSTALL_MONITORING" = "y" ]; then
+      yesno INSTALL_METRICS_AUTH "y" "Gate Prometheus/Grafana behind Synapse login (metrics-auth proxy)?"
+    fi
+    read -p "First admin Matrix user (localpart, e.g. admin) [admin]: " ADMIN_USER
+    ADMIN_USER="${ADMIN_USER:-admin}"
 
-  echo ""
-  echo "Summary:"
-  echo "  Matrix URL: https://$MATRIX_DOMAIN"
-  echo "  Server name (MXID): $SERVER_NAME"
-  echo "  .well-known on: $ROOT_DOMAIN"
-  echo "  Federation: $FEDERATION | Coturn: $INSTALL_COTURN | Monitoring: $INSTALL_MONITORING | Element Call: $INSTALL_ELEMENT_CALL"
-  echo "  Fail2ban: $INSTALL_FAIL2BAN | Backup: $INSTALL_BACKUP_CRON | Mjolnir: $INSTALL_MJOLNIR | Maubot: $INSTALL_MAUBOT | Discord: $INSTALL_DISCORD | Metrics-auth: $INSTALL_METRICS_AUTH"
-  read -p "Continue? (y/n) [y]: " cont
-  cont="${cont:-y}"
-  [[ "$cont" =~ ^[yY] ]] || exit 0
+    echo ""
+    echo "Summary:"
+    echo "  Matrix URL: https://$MATRIX_DOMAIN"
+    echo "  Server name (MXID): $SERVER_NAME"
+    echo "  .well-known on: $ROOT_DOMAIN"
+    echo "  Federation: $FEDERATION | Coturn: $INSTALL_COTURN | Monitoring: $INSTALL_MONITORING | Element Call: $INSTALL_ELEMENT_CALL"
+    echo "  Fail2ban: $INSTALL_FAIL2BAN | Backup: $INSTALL_BACKUP_CRON | Mjolnir: $INSTALL_MJOLNIR | Maubot: $INSTALL_MAUBOT | Discord: $INSTALL_DISCORD | Metrics-auth: $INSTALL_METRICS_AUTH"
+    read -p "Continue? (y/n) [y]: " cont
+    cont="${cont:-y}"
+    [[ "$cont" =~ ^[yY] ]] || exit 0
+  fi
 }
 
 # ========== Phase 1: Base packages ==========
@@ -111,7 +127,8 @@ install_synapse() {
     echo "  Synapse already installed, skipping."
     return 0
   fi
-  wget -qO - https://packages.matrix.org/debian/matrix.org-2023-11-28.asc | gpg --dearmor -o /usr/share/keyrings/matrix-org-archive-keyring.gpg
+  # Key is provided as .gpg keyring (not .asc); see https://packages.matrix.org/debian/
+  wget -qO /usr/share/keyrings/matrix-org-archive-keyring.gpg https://packages.matrix.org/debian/matrix-org-archive-keyring.gpg
   echo "deb [signed-by=/usr/share/keyrings/matrix-org-archive-keyring.gpg] https://packages.matrix.org/debian/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/matrix-org.list
   apt-get update -qq && apt-get install -y -qq matrix-synapse-py3
   systemctl enable matrix-synapse
@@ -205,17 +222,39 @@ if c and 'listeners' in c:
   echo "  Synapse configured (registration off, listener with x_forwarded)."
 }
 
-# ========== Phase 5: nginx + TLS (certbot) ==========
+# ========== Phase 5: nginx + TLS (certbot or self-signed) ==========
 setup_nginx_tls() {
   echo "[5/14] Configuring nginx and TLS..."
   # Stop nginx so certbot can bind 80 if needed
   systemctl stop nginx 2>/dev/null || true
-  # Cert for matrix domain
-  certbot certonly --nginx -d "$MATRIX_DOMAIN" --email "$LE_EMAIL" --agree-tos --non-interactive --redirect 2>/dev/null || certbot certonly --standalone -d "$MATRIX_DOMAIN" --email "$LE_EMAIL" --agree-tos --non-interactive 2>/dev/null || true
-  # Cert for root domain if different (for .well-known)
-  if [ "$ROOT_DOMAIN" != "$MATRIX_DOMAIN" ]; then
-    certbot certonly --nginx -d "$ROOT_DOMAIN" --email "$LE_EMAIL" --agree-tos --non-interactive 2>/dev/null || certbot certonly --standalone -d "$ROOT_DOMAIN" --email "$LE_EMAIL" --agree-tos --non-interactive 2>/dev/null || true
+
+  SSL_CERT_PATH=""
+  SSL_KEY_PATH=""
+  SSL_OPTIONS_INCLUDE="include /etc/letsencrypt/options-ssl-nginx.conf;"
+  if [ "${USE_SELF_SIGNED_CERT:-0}" = "1" ]; then
+    # QA / no-DNS: self-signed cert (one cert for matrix domain; reuse for root if different)
+    mkdir -p /etc/nginx/ssl
+    SSL_CERT_PATH="/etc/nginx/ssl/matrix-selfsigned.crt"
+    SSL_KEY_PATH="/etc/nginx/ssl/matrix-selfsigned.key"
+    if [ ! -f "$SSL_KEY_PATH" ]; then
+      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout "$SSL_KEY_PATH" -out "$SSL_CERT_PATH" \
+        -subj "/CN=$MATRIX_DOMAIN/O=Matrix QA"
+      chmod 644 "$SSL_CERT_PATH" "$SSL_KEY_PATH"
+    fi
+    SSL_OPTIONS_INCLUDE="ssl_protocols TLSv1.2 TLSv1.3; ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;"
+    echo "  Using self-signed cert (USE_SELF_SIGNED_CERT=1)."
+  else
+    # Cert for matrix domain
+    certbot certonly --nginx -d "$MATRIX_DOMAIN" --email "$LE_EMAIL" --agree-tos --non-interactive --redirect 2>/dev/null || certbot certonly --standalone -d "$MATRIX_DOMAIN" --email "$LE_EMAIL" --agree-tos --non-interactive 2>/dev/null || true
+    # Cert for root domain if different (for .well-known)
+    if [ "$ROOT_DOMAIN" != "$MATRIX_DOMAIN" ]; then
+      certbot certonly --nginx -d "$ROOT_DOMAIN" --email "$LE_EMAIL" --agree-tos --non-interactive 2>/dev/null || certbot certonly --standalone -d "$ROOT_DOMAIN" --email "$LE_EMAIL" --agree-tos --non-interactive 2>/dev/null || true
+    fi
+    SSL_CERT_PATH="/etc/letsencrypt/live/$MATRIX_DOMAIN/fullchain.pem"
+    SSL_KEY_PATH="/etc/letsencrypt/live/$MATRIX_DOMAIN/privkey.pem"
   fi
+
   # Matrix site: 80 -> 301 https, 443 -> proxy to Synapse + static well-known
   mkdir -p /var/www/matrix-well-known/.well-known/matrix
   echo "{\"m.homeserver\":{\"base_url\":\"https://$MATRIX_DOMAIN/\"}}" > /var/www/matrix-well-known/.well-known/matrix/client
@@ -224,7 +263,14 @@ setup_nginx_tls() {
   if [ "$FEDERATION" = "y" ]; then
     echo "{\"m.server\":\"$MATRIX_DOMAIN:443\"}" > /var/www/matrix-well-known/.well-known/matrix/server
   fi
-  # nginx sites: minimal matrix 80+443
+  # Root domain cert paths (same as matrix when self-signed or when root == matrix)
+  ROOT_SSL_CERT="$SSL_CERT_PATH"
+  ROOT_SSL_KEY="$SSL_KEY_PATH"
+  if [ "$ROOT_DOMAIN" != "$MATRIX_DOMAIN" ] && [ "${USE_SELF_SIGNED_CERT:-0}" != "1" ]; then
+    ROOT_SSL_CERT="/etc/letsencrypt/live/$ROOT_DOMAIN/fullchain.pem"
+    ROOT_SSL_KEY="/etc/letsencrypt/live/$ROOT_DOMAIN/privkey.pem"
+  fi
+  # nginx sites: minimal matrix 80+443 (variables expanded)
   cat > /etc/nginx/sites-available/matrix << NGINX_MATRIX
 # Generated by setup-from-scratch.sh
 server {
@@ -242,9 +288,9 @@ server {
     listen 443 ssl;
     http2 on;
     server_name $MATRIX_DOMAIN;
-    ssl_certificate /etc/letsencrypt/live/$MATRIX_DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$MATRIX_DOMAIN/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_certificate $SSL_CERT_PATH;
+    ssl_certificate_key $SSL_KEY_PATH;
+    $SSL_OPTIONS_INCLUDE
     client_max_body_size 50M;
     location /.well-known/matrix/client {
         default_type application/json;
@@ -258,16 +304,15 @@ server {
     location / { return 200 'OK'; add_header Content-Type text/plain; }
 }
 NGINX_MATRIX
-  # Root domain site for .well-known (if different from matrix)
   if [ "$ROOT_DOMAIN" != "$MATRIX_DOMAIN" ]; then
     cat > /etc/nginx/sites-available/root-wellknown << NGINX_ROOT
 server {
     listen 443 ssl;
     http2 on;
     server_name $ROOT_DOMAIN;
-    ssl_certificate /etc/letsencrypt/live/$ROOT_DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$ROOT_DOMAIN/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_certificate $ROOT_SSL_CERT;
+    ssl_certificate_key $ROOT_SSL_KEY;
+    $SSL_OPTIONS_INCLUDE
     location = /.well-known/matrix/client {
         default_type application/json;
         add_header Access-Control-Allow-Origin "*" always;
@@ -729,6 +774,16 @@ sed -i "s|@admin:$SERVER_NAME|$BRIDGE_ADMIN|g" /opt/discord-bridge/config.yaml
 # ========== Create first user ==========
 create_admin_user() {
   echo ""
+  if [ "${NON_INTERACTIVE:-0}" = "1" ]; then
+    if [ -n "$ADMIN_PASSWORD" ]; then
+      echo "  Creating admin user @${ADMIN_USER}:$SERVER_NAME (NON_INTERACTIVE)..."
+      (echo "$ADMIN_PASSWORD"; echo "$ADMIN_PASSWORD") | register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml http://localhost:8008 -u "$ADMIN_USER" -p -a 2>/dev/null || true
+      [ $? -eq 0 ] && echo "  Admin created." || echo "  Run manually: register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml http://localhost:8008 -u $ADMIN_USER -p -a"
+    else
+      echo "  Skipping admin user (set ADMIN_PASSWORD to create in non-interactive mode). Run: register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml http://localhost:8008 -u $ADMIN_USER -p -a"
+    fi
+    return 0
+  fi
   read -p "Create first admin user @${ADMIN_USER}:$SERVER_NAME now? (y/n) [y]: " do_user
   do_user="${do_user:-y}"
   if [[ "$do_user" =~ ^[yY] ]]; then
