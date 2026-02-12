@@ -2,6 +2,21 @@
 
 Minimal Synapse deployment for QA: run the Matrix stack test suite against a Synapse instance in any Kubernetes cluster (k3s, kind, minikube, EKS, etc.).
 
+**Run everything from this repo’s root.** Clone the repo if needed, then `cd` into `hardened-matrix-stack-install-from-scratch` so that `./k8s-qa/run-matrix-qa-tests.sh` and `kubectl apply -f k8s-qa/` use the files in this directory.
+
+## kubectl and kubeconfig
+
+`kubectl` must be able to read your cluster config. If you see **permission denied** on the kubeconfig (e.g. k3s’s `/etc/rancher/k3s/k3s.yaml`):
+
+- **Option A:** Copy it to your user and set `KUBECONFIG`:
+  ```bash
+  sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+  sudo chown "$(whoami):" ~/.kube/config
+  export KUBECONFIG=~/.kube/config
+  ```
+- **Option B:** Use `sudo kubectl` for apply/delete/port-forward.
+- **Option C (k3s):** Restart k3s with `--write-kubeconfig-mode 644` so the default kubeconfig is world-readable (see k3s docs).
+
 ## What’s in k8s-qa
 
 - **namespace.yaml** — `matrix-qa` namespace.
