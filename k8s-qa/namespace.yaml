@@ -1,0 +1,6 @@
+# Matrix QA namespace for Kubernetes (e.g. k3s, kind, minikube).
+# Apply: kubectl apply -f k8s-qa/
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: matrix-qa

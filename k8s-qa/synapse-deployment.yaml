@@ -1,0 +1,90 @@
+# Synapse QA: minimal instance for testing the Matrix client API in Kubernetes.
+# Init generates config+keys; main runs Synapse. No TLS (use NodePort or port-forward).
+# Apply: kubectl apply -f k8s-qa/
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: synapse
+  namespace: matrix-qa
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: synapse
+  template:
+    metadata:
+      labels:
+        app: synapse
+    spec:
+      initContainers:
+        - name: generate
+          image: matrixdotorg/synapse:v1.107.0
+          args: ["generate"]
+          env:
+            - name: SYNAPSE_SERVER_NAME
+              value: "qa.local"
+            - name: SYNAPSE_REPORT_STATS
+              value: "no"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+        - name: patch-config
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              sed -i 's/^registration_shared_secret:.*/registration_shared_secret: "qa-test-registration-secret"/' /data/homeserver.yaml || echo 'registration_shared_secret: "qa-test-registration-secret"' >> /data/homeserver.yaml
+              grep -q "enable_registration_without_verification" /data/homeserver.yaml || printf '\nenable_registration_without_verification: true\n' >> /data/homeserver.yaml
+              chown -R 991:991 /data
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: synapse
+          image: matrixdotorg/synapse:v1.107.0
+          args: ["run"]
+          ports:
+            - containerPort: 8008
+              name: http
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /_matrix/client/versions
+              port: 8008
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: synapse
+  namespace: matrix-qa
+spec:
+  type: NodePort
+  selector:
+    app: synapse
+  ports:
+    - port: 8008
+      targetPort: 8008
+      nodePort: 30048
+      name: http
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: synapse-secrets
+  namespace: matrix-qa
+type: Opaque
+stringData:
+  registration-shared-secret: "qa-test-registration-secret"

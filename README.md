@@ -63,6 +63,15 @@ sudo -E ./run-qa-noninteractive.sh
 
 Defaults: `MATRIX_DOMAIN=matrix.qa.local`, `SERVER_NAME=qa.local`, `USE_SELF_SIGNED_CERT=1`. Override with env vars (see script). Set `ADMIN_PASSWORD` to create the first admin user without a prompt. Full installation requires a real Debian/Ubuntu system (or VM) with systemd; the script will fail in a minimal container without running PostgreSQL/nginx.
 
+## Testing in Kubernetes
+
+To run the Matrix client API test suite against a minimal Synapse instance in any Kubernetes cluster (k3s, kind, minikube, etc.):
+
+1. **Deploy:** `kubectl apply -f k8s-qa/` (wait for pod `1/1` Ready).
+2. **Run tests:** From repo root, `./k8s-qa/run-matrix-qa-tests.sh` (NodePort 30048), or `./k8s-qa/port-forward-and-test.sh` when not on the node.
+
+See **[k8s-qa/README.md](k8s-qa/README.md)** for deploy, access (NodePort / port-forward), test script options, and teardown.
+
 ## Contents of this repo
 
 - **setup-from-scratch.sh** — Main script (run as root).
@@ -78,6 +87,7 @@ Defaults: `MATRIX_DOMAIN=matrix.qa.local`, `SERVER_NAME=qa.local`, `USE_SELF_SIG
 - **mjolnir-production.yaml**, **setup-mjolnir.sh** — Mjolnir config template and standalone setup helper.
 - **maubot-patch.yaml**, **setup-maubot-user.sh** — Maubot config and user-creation helper.
 - **discord-bridge-config.yaml**, **synapse-appservice-discord.yaml** — Discord bridge template and Synapse appservice include.
+- **k8s-qa/** — Kubernetes manifests and scripts to run a minimal Synapse QA instance and the Matrix API test suite; see [k8s-qa/README.md](k8s-qa/README.md).
 
 ## After setup
 
