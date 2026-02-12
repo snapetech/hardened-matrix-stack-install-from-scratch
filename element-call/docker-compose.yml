@@ -12,10 +12,11 @@ services:
     hostname: livekit-sfu
     command: --config /etc/livekit.yaml
     restart: unless-stopped
+    # Bind to localhost so only nginx (reverse proxy) can reach; UDP stays public for WebRTC media
     ports:
-      - "7880:7880/tcp"
-      - "7881:7881/tcp"
-      - "7882:7882/tcp"
+      - "127.0.0.1:7880:7880/tcp"
+      - "127.0.0.1:7881:7881/tcp"
+      - "127.0.0.1:7882:7882/tcp"
       - "50000-50200:50000-50200/udp"
     volumes:
       - ./livekit.yaml:/etc/livekit.yaml:ro
@@ -35,7 +36,8 @@ services:
     deploy:
       restart_policy:
         condition: on-failure
+    # Bind to localhost; nginx proxies /livekit/jwt to this port
     ports:
-      - "6080:6080"
+      - "127.0.0.1:6080:6080"
     networks:
       - ecbackend

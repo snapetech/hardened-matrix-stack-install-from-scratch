@@ -299,10 +299,14 @@ listeners:
     type: metrics
     bind_addresses: ['127.0.0.1', '::1']
 EOF
-  # URL preview off, ip blacklist, no-federation whitelist
+  # URL preview off, ip blacklist; no-federation whitelist only when federation is disabled
   [ -f "$REPO_DIR/synapse-url-preview.yaml" ] && cp "$REPO_DIR/synapse-url-preview.yaml" /etc/matrix-synapse/conf.d/45-url-preview.yaml || true
   [ -f "$REPO_DIR/synapse-ip-blacklist.yaml" ] && cp "$REPO_DIR/synapse-ip-blacklist.yaml" /etc/matrix-synapse/conf.d/46-ip-blacklist.yaml || true
-  [ -f "$REPO_DIR/synapse-no-federation.yaml" ] && cp "$REPO_DIR/synapse-no-federation.yaml" /etc/matrix-synapse/conf.d/44-no-federation.yaml || true
+  if [ "$FEDERATION" = "y" ]; then
+    rm -f /etc/matrix-synapse/conf.d/44-no-federation.yaml
+  else
+    [ -f "$REPO_DIR/synapse-no-federation.yaml" ] && cp "$REPO_DIR/synapse-no-federation.yaml" /etc/matrix-synapse/conf.d/44-no-federation.yaml || true
+  fi
   # Remove default listener from main config if it exists (we use conf.d)
   if [ -f /etc/matrix-synapse/homeserver.yaml ]; then
     python3 -c "
@@ -487,7 +491,10 @@ setup_monitoring() {
   [ -f "$REPO_DIR/grafana/provisioning/datasources/prometheus.yml" ] && cp "$REPO_DIR/grafana/provisioning/datasources/prometheus.yml" /etc/grafana/provisioning/datasources/ || true
   [ -f "$REPO_DIR/grafana/dashboards/matrix-overview.json" ] && mkdir -p /etc/grafana/provisioning/dashboards/matrix && cp "$REPO_DIR/grafana/dashboards/matrix-overview.json" /etc/grafana/provisioning/dashboards/matrix/ || true
   [ -f "$REPO_DIR/grafana/provisioning/dashboards/dashboards.yml" ] && sed 's|path:.*|path: /etc/grafana/provisioning/dashboards/matrix|' "$REPO_DIR/grafana/provisioning/dashboards/dashboards.yml" > /etc/grafana/provisioning/dashboards/dashboards.yml || true
-  [ -f "$REPO_DIR/grafana/conf.d/anonymous.ini" ] && mkdir -p /etc/grafana/conf.d && cp "$REPO_DIR/grafana/conf.d/anonymous.ini" /etc/grafana/conf.d/ || true
+  # Only enable anonymous Grafana when metrics are gated behind metrics-auth (avoids accidental public dashboards)
+  if [ "$INSTALL_METRICS_AUTH" = "y" ] && [ -f "$REPO_DIR/grafana/conf.d/anonymous.ini" ]; then
+    mkdir -p /etc/grafana/conf.d && cp "$REPO_DIR/grafana/conf.d/anonymous.ini" /etc/grafana/conf.d/
+  fi
   svc_enable grafana-server
   svc_start grafana-server
   echo "  Prometheus + Grafana installed (Prometheus on :9090, Grafana on :3000)."
@@ -506,6 +513,7 @@ setup_metrics_auth() {
   # Bind Prometheus to localhost and set external-url for subpath
   if [ -f /etc/default/prometheus ]; then
     grep -q "web.listen-address" /etc/default/prometheus 2>/dev/null || echo 'ARGS="--web.listen-address=127.0.0.1:9090 --web.external-url=https://'"$MATRIX_DOMAIN"'/metrics/ --web.route-prefix=/"' >> /etc/default/prometheus
+    svc_restart prometheus
   fi
   # Grafana: serve from subpath /metrics/grafana
   mkdir -p /etc/grafana/conf.d
@@ -561,8 +569,8 @@ location /metrics/grafana/ {
     proxy_redirect http://127.0.0.1:3000/ https://$MATRIX_DOMAIN/metrics/grafana/;
 }
 EOF
-    # Insert include before "location /_matrix" in the 443 server block
-    sed -i '/listen 443 ssl;/a\    include /etc/nginx/snippets/metrics-grafana.conf;' /etc/nginx/sites-available/matrix
+    # Insert include in the 443 server block (match actual vhost line: listen 443 ssl http2;)
+    sed -i '/listen 443 ssl http2;/a\    include /etc/nginx/snippets/metrics-grafana.conf;' /etc/nginx/sites-available/matrix
     nginx -t && svc_reload nginx
   fi
   echo "  Metrics-auth proxy installed. Metrics at https://$MATRIX_DOMAIN/metrics/ (login with Matrix account)."
@@ -641,6 +649,9 @@ with open(p, 'w') as f: json.dump(d, f, indent=2)
   if ! grep -q "livekit/jwt" /etc/nginx/sites-available/matrix 2>/dev/null; then
     LIVEKIT_SNIPPET="/etc/nginx/snippets/element-call-livekit.conf"
     cat > "$LIVEKIT_SNIPPET" << EOF
+# Redirect no-trailing-slash to slash so clients hitting /livekit/jwt or /livekit/sfu still work
+location = /livekit/jwt { return 301 /livekit/jwt/; }
+location = /livekit/sfu { return 301 /livekit/sfu/; }
 location ^~ /livekit/jwt/ {
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
@@ -661,7 +672,8 @@ location ^~ /livekit/sfu/ {
     proxy_pass http://127.0.0.1:7880/;
 }
 EOF
-    sed -i '/listen 443 ssl;/a\    include /etc/nginx/snippets/element-call-livekit.conf;' /etc/nginx/sites-available/matrix
+    # Insert include in the 443 server block (match actual vhost line: listen 443 ssl http2;)
+    sed -i '/listen 443 ssl http2;/a\    include /etc/nginx/snippets/element-call-livekit.conf;' /etc/nginx/sites-available/matrix
     nginx -t && svc_reload nginx
   fi
   chown -R matrix-synapse:matrix-synapse /etc/matrix-synapse/conf.d

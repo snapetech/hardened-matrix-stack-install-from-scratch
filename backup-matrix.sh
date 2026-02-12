@@ -26,7 +26,9 @@ done
 OUTPUT_DIR="${OUTPUT_DIR:-/var/backups/matrix}"
 STAMP=$(date +%Y%m%d-%H%M%S)
 DEST="${OUTPUT_DIR}/${STAMP}"
+umask 077
 mkdir -p "$DEST"
+chmod 700 "$DEST"
 
 # 1) Postgres (password from Synapse database.yaml)
 DB_YAML="/etc/matrix-synapse/conf.d/database.yaml"
