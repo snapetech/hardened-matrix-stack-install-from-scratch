@@ -45,6 +45,104 @@ DISCORD_BOT_TOKEN=""
 die() { echo "Error: $*" >&2; exit 1; }
 prompt() { local v="$1"; local def="$2"; local p="$3"; shift 3; read -p "$p [$def]: " "$v"; eval "[ -z \"\$$v\" ] && $v=\"$def\""; }
 yesno() { local v="$1"; local def="$2"; local p="$3"; read -p "$p (y/n) [$def]: " "$v"; eval "[ -z \"\$$v\" ] && $v=\"$def\""; eval "$v=\$(echo \$$v | tr '[:upper:]' '[:lower:]')"; }
+# Run command as postgres user (works with or without sudo, e.g. in containers)
+run_as_postgres() {
+  if command -v sudo &>/dev/null; then
+    sudo -u postgres "$@"
+  else
+    # Use -- so su does not parse command args (e.g. psql -t, createuser -D) as su options
+    su postgres -s /bin/bash -c 'exec "$@"' -- _ "$@"
+  fi
+}
+
+# ========== No-systemd (container) support ==========
+# When systemd is not running (e.g. Docker), start/stop services manually so the script runs front-to-back.
+NO_SYSTEMD=0
+if [ ! -d /run/systemd/system ] || ! systemctl is-system-running &>/dev/null; then
+  NO_SYSTEMD=1
+  echo "  (No systemd detected; will start services manually for container/QA.)"
+fi
+# Allow Debian invoke-rc.d to start services when we run them manually (policy-rc.d often blocks in containers)
+allow_container_services() {
+  if [ "$NO_SYSTEMD" = "1" ] && [ -x /usr/sbin/policy-rc.d ]; then
+    echo 'exit 0' > /usr/sbin/policy-rc.d
+    chmod +x /usr/sbin/policy-rc.d
+  fi
+}
+svc_enable() { [ "$NO_SYSTEMD" = "0" ] && systemctl enable "$1" 2>/dev/null || true; }
+svc_stop() {
+  local s="$1"
+  if [ "$NO_SYSTEMD" = "1" ]; then
+    case "$s" in
+      nginx) nginx -s stop 2>/dev/null || true ;;
+      matrix-synapse) [ -f /run/matrix-synapse.pid ] && (kill "$(cat /run/matrix-synapse.pid)" 2>/dev/null || true); rm -f /run/matrix-synapse.pid ;;
+      *) true ;;
+    esac
+  else
+    systemctl stop "$s" 2>/dev/null || true
+  fi
+}
+svc_start() {
+  local s="$1"
+  if [ "$NO_SYSTEMD" = "1" ]; then
+    case "$s" in
+      postgresql)
+        allow_container_services
+        if ! pg_lsclusters -h 2>/dev/null | grep -q .; then
+          # No cluster yet (e.g. container postinst skipped start); create one
+          for ver in 15 16 14 17; do
+            [ -d /usr/lib/postgresql/$ver ] && pg_createcluster "$ver" main 2>/dev/null && break
+          done
+        fi
+        pg_lsclusters -h 2>/dev/null | while read -r ver _ _ _ _ _; do
+          pg_ctlcluster "$ver" main start 2>/dev/null || true
+          break
+        done
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+          run_as_postgres psql -tAc "SELECT 1" 2>/dev/null && break
+          sleep 1
+        done
+        ;;
+      nginx) nginx 2>/dev/null || true ;;
+      matrix-synapse)
+        mkdir -p /run
+        start-stop-daemon --start --background --pidfile /run/matrix-synapse.pid --make-pidfile --chuid matrix-synapse:matrix-synapse --exec /usr/bin/python3 -- -m synapse.app.homeserver -c /etc/matrix-synapse/homeserver.yaml 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+          if curl -s -o /dev/null http://127.0.0.1:8008/health 2>/dev/null; then break; fi
+          sleep 1
+        done
+        ;;
+      coturn) cmd=$(command -v turnserver 2>/dev/null) && [ -x "$cmd" ] && ($cmd -c /etc/turnserver.conf --daemon 2>/dev/null || true) || true ;;
+      prometheus) [ -x /usr/bin/prometheus ] && (prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/var/lib/prometheus --web.listen-address=127.0.0.1:9090 &) 2>/dev/null || true ;;
+      prometheus-node-exporter) [ -x /usr/bin/prometheus-node-exporter ] && (prometheus-node-exporter &) 2>/dev/null || true ;;
+      grafana-server) [ -x /usr/sbin/grafana-server ] && (grafana-server --homepath=/usr/share/grafana &) 2>/dev/null || true ;;
+      metrics-auth-proxy) [ -x /opt/metrics-auth/metrics-auth-proxy.py ] && (python3 /opt/metrics-auth/metrics-auth-proxy.py &) 2>/dev/null || true ;;
+      fail2ban) fail2ban-client start 2>/dev/null || true ;;
+      docker) [ -x /usr/bin/dockerd ] && (dockerd &) 2>/dev/null || true ;;
+      *) true ;;
+    esac
+  else
+    systemctl start "$s" 2>/dev/null || true
+  fi
+}
+svc_restart() {
+  local s="$1"
+  if [ "$NO_SYSTEMD" = "1" ]; then
+    svc_stop "$s"
+    sleep 1
+    svc_start "$s"
+  else
+    systemctl restart "$s" 2>/dev/null || true
+  fi
+}
+svc_reload() {
+  local s="$1"
+  if [ "$NO_SYSTEMD" = "1" ]; then
+    [ "$s" = "nginx" ] && nginx -s reload 2>/dev/null || true
+  else
+    systemctl reload "$s" 2>/dev/null || true
+  fi
+}
 
 # ========== Phase 0: Requirements and prompts ==========
 run_prompts() {
@@ -109,7 +207,7 @@ install_base() {
   echo "[1/14] Installing base packages..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq curl wget ca-certificates gnupg lsb-release \
+  apt-get install -y -qq apt-utils curl wget ca-certificates gnupg lsb-release \
     postgresql postgresql-client nginx certbot python3-certbot-nginx \
     python3 python3-pip python3-venv
   if [ "$INSTALL_COTURN" = "y" ]; then
@@ -131,16 +229,17 @@ install_synapse() {
   wget -qO /usr/share/keyrings/matrix-org-archive-keyring.gpg https://packages.matrix.org/debian/matrix-org-archive-keyring.gpg
   echo "deb [signed-by=/usr/share/keyrings/matrix-org-archive-keyring.gpg] https://packages.matrix.org/debian/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/matrix-org.list
   apt-get update -qq && apt-get install -y -qq matrix-synapse-py3
-  systemctl enable matrix-synapse
+  svc_enable matrix-synapse
 }
 
 # ========== Phase 3: Postgres DB for Synapse ==========
 setup_postgres() {
   echo "[3/14] Setting up PostgreSQL for Synapse..."
+  svc_start postgresql
   SYNAPSE_DB_PASSWORD="${SYNAPSE_DB_PASSWORD:-$(openssl rand -hex 16)}"
-  sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='synapse'" | grep -q 1 || sudo -u postgres createuser -D -R -S synapse
-  sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='synapse'" | grep -q 1 || sudo -u postgres createdb -O synapse synapse
-  sudo -u postgres psql -c "ALTER USER synapse WITH PASSWORD '$SYNAPSE_DB_PASSWORD';" 2>/dev/null || true
+  run_as_postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='synapse'" | grep -q 1 || run_as_postgres createuser -D -R -S synapse
+  run_as_postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='synapse'" | grep -q 1 || run_as_postgres createdb -O synapse synapse
+  run_as_postgres psql -c "ALTER USER synapse WITH PASSWORD '$SYNAPSE_DB_PASSWORD';" 2>/dev/null || true
   mkdir -p /etc/matrix-synapse/conf.d
   chown -R matrix-synapse:matrix-synapse /etc/matrix-synapse
   # database.yaml
@@ -217,8 +316,8 @@ if c and 'listeners' in c:
   fi
   chown -R matrix-synapse:matrix-synapse /etc/matrix-synapse/conf.d
   # Signing key is created by Synapse on first start if missing
-  systemctl start matrix-synapse || true
-  systemctl enable matrix-synapse
+  svc_start matrix-synapse
+  svc_enable matrix-synapse
   echo "  Synapse configured (registration off, listener with x_forwarded)."
 }
 
@@ -226,7 +325,7 @@ if c and 'listeners' in c:
 setup_nginx_tls() {
   echo "[5/14] Configuring nginx and TLS..."
   # Stop nginx so certbot can bind 80 if needed
-  systemctl stop nginx 2>/dev/null || true
+  svc_stop nginx
 
   SSL_CERT_PATH=""
   SSL_KEY_PATH=""
@@ -285,8 +384,7 @@ server {
     location / { return 301 https://\$host\$request_uri; }
 }
 server {
-    listen 443 ssl;
-    http2 on;
+    listen 443 ssl http2;
     server_name $MATRIX_DOMAIN;
     ssl_certificate $SSL_CERT_PATH;
     ssl_certificate_key $SSL_KEY_PATH;
@@ -307,8 +405,7 @@ NGINX_MATRIX
   if [ "$ROOT_DOMAIN" != "$MATRIX_DOMAIN" ]; then
     cat > /etc/nginx/sites-available/root-wellknown << NGINX_ROOT
 server {
-    listen 443 ssl;
-    http2 on;
+    listen 443 ssl http2;
     server_name $ROOT_DOMAIN;
     ssl_certificate $ROOT_SSL_CERT;
     ssl_certificate_key $ROOT_SSL_KEY;
@@ -327,7 +424,7 @@ NGINX_ROOT
   fi
   ln -sf /etc/nginx/sites-available/matrix /etc/nginx/sites-enabled/ 2>/dev/null || true
   rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-  nginx -t && systemctl enable nginx && systemctl start nginx
+  nginx -t && svc_enable nginx && svc_start nginx
   echo "  nginx + TLS configured. Test: https://$MATRIX_DOMAIN/_matrix/client/versions"
 }
 
@@ -351,8 +448,8 @@ static-auth-secret=$(cat /root/.matrix-turn-secret)
 realm=$SERVER_NAME
 EOF
   fi
-  systemctl enable coturn
-  systemctl start coturn 2>/dev/null || true
+  svc_enable coturn
+  svc_start coturn
   # Synapse turn config
   cat > /etc/matrix-synapse/conf.d/turn.yaml << EOF
 turn_uris:
@@ -363,7 +460,7 @@ turn_user_lifetime: 86400000
 turn_allow_guests: false
 EOF
   chown matrix-synapse:matrix-synapse /etc/matrix-synapse/conf.d/turn.yaml
-  systemctl restart matrix-synapse
+  svc_restart matrix-synapse
   echo "  Coturn enabled; TURN secret in /root/.matrix-turn-secret"
 }
 
@@ -376,8 +473,10 @@ setup_monitoring() {
   mkdir -p /etc/prometheus
   [ -f "$REPO_DIR/prometheus-full.yml" ] && sed "s/matrix.example.com/$MATRIX_DOMAIN/g;s/example.com/$SERVER_NAME/g" "$REPO_DIR/prometheus-full.yml" > /etc/prometheus/prometheus.yml || true
   [ -f "$REPO_DIR/prometheus-alerts.yml" ] && cp "$REPO_DIR/prometheus-alerts.yml" /etc/prometheus/ || true
-  systemctl enable prometheus prometheus-node-exporter
-  systemctl start prometheus prometheus-node-exporter 2>/dev/null || true
+  svc_enable prometheus
+  svc_enable prometheus-node-exporter
+  svc_start prometheus
+  svc_start prometheus-node-exporter
   # Grafana
   if ! command -v grafana-server &>/dev/null; then
     wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor -o /usr/share/keyrings/grafana.gpg
@@ -389,8 +488,8 @@ setup_monitoring() {
   [ -f "$REPO_DIR/grafana/dashboards/matrix-overview.json" ] && mkdir -p /etc/grafana/provisioning/dashboards/matrix && cp "$REPO_DIR/grafana/dashboards/matrix-overview.json" /etc/grafana/provisioning/dashboards/matrix/ || true
   [ -f "$REPO_DIR/grafana/provisioning/dashboards/dashboards.yml" ] && sed 's|path:.*|path: /etc/grafana/provisioning/dashboards/matrix|' "$REPO_DIR/grafana/provisioning/dashboards/dashboards.yml" > /etc/grafana/provisioning/dashboards/dashboards.yml || true
   [ -f "$REPO_DIR/grafana/conf.d/anonymous.ini" ] && mkdir -p /etc/grafana/conf.d && cp "$REPO_DIR/grafana/conf.d/anonymous.ini" /etc/grafana/conf.d/ || true
-  systemctl enable grafana-server
-  systemctl start grafana-server 2>/dev/null || true
+  svc_enable grafana-server
+  svc_start grafana-server
   echo "  Prometheus + Grafana installed (Prometheus on :9090, Grafana on :3000)."
 }
 
@@ -401,9 +500,9 @@ setup_metrics_auth() {
   mkdir -p /opt/metrics-auth
   [ -f "$REPO_DIR/metrics-auth-proxy.py" ] && cp "$REPO_DIR/metrics-auth-proxy.py" /opt/metrics-auth/ && chmod 755 /opt/metrics-auth/metrics-auth-proxy.py
   [ -f "$REPO_DIR/metrics-auth-proxy.service" ] && sed "s|https://matrix.example.com|https://$MATRIX_DOMAIN|g" "$REPO_DIR/metrics-auth-proxy.service" > /etc/systemd/system/metrics-auth-proxy.service
-  systemctl daemon-reload
-  systemctl enable metrics-auth-proxy
-  systemctl start metrics-auth-proxy 2>/dev/null || true
+  [ "$NO_SYSTEMD" = "0" ] && systemctl daemon-reload 2>/dev/null || true
+  svc_enable metrics-auth-proxy
+  svc_start metrics-auth-proxy
   # Bind Prometheus to localhost and set external-url for subpath
   if [ -f /etc/default/prometheus ]; then
     grep -q "web.listen-address" /etc/default/prometheus 2>/dev/null || echo 'ARGS="--web.listen-address=127.0.0.1:9090 --web.external-url=https://'"$MATRIX_DOMAIN"'/metrics/ --web.route-prefix=/"' >> /etc/default/prometheus
@@ -416,7 +515,7 @@ setup_metrics_auth() {
 root_url = https://$MATRIX_DOMAIN/metrics/grafana
 serve_from_sub_path = true
 EOF
-    systemctl restart grafana-server 2>/dev/null || true
+    svc_restart grafana-server
   fi
   # Nginx: add metrics-auth and /metrics/ and /metrics/grafana/ to matrix 443 server block
   mkdir -p /etc/nginx/snippets
@@ -464,7 +563,7 @@ location /metrics/grafana/ {
 EOF
     # Insert include before "location /_matrix" in the 443 server block
     sed -i '/listen 443 ssl;/a\    include /etc/nginx/snippets/metrics-grafana.conf;' /etc/nginx/sites-available/matrix
-    nginx -t && systemctl reload nginx
+    nginx -t && svc_reload nginx
   fi
   echo "  Metrics-auth proxy installed. Metrics at https://$MATRIX_DOMAIN/metrics/ (login with Matrix account)."
 }
@@ -476,8 +575,8 @@ setup_element_call() {
   # Install Docker if not present
   if ! command -v docker &>/dev/null; then
     curl -fsSL https://get.docker.com | sh
-    systemctl enable docker
-    systemctl start docker
+    svc_enable docker
+    svc_start docker
   fi
   if ! command -v docker compose &>/dev/null && ! docker-compose --version &>/dev/null 2>&1; then
     apt-get install -y -qq docker-compose-plugin 2>/dev/null || true
@@ -563,10 +662,10 @@ location ^~ /livekit/sfu/ {
 }
 EOF
     sed -i '/listen 443 ssl;/a\    include /etc/nginx/snippets/element-call-livekit.conf;' /etc/nginx/sites-available/matrix
-    nginx -t && systemctl reload nginx
+    nginx -t && svc_reload nginx
   fi
   chown -R matrix-synapse:matrix-synapse /etc/matrix-synapse/conf.d
-  systemctl restart matrix-synapse 2>/dev/null || true
+  svc_restart matrix-synapse
   echo "  Element Call backend at /opt/element-call (LiveKit + lk-jwt-service). .well-known updated for MSC4143."
 }
 
@@ -588,7 +687,7 @@ setup_fail2ban_nginx_hardening() {
     if ! grep -q synapse-hardening /etc/nginx/sites-available/matrix 2>/dev/null; then
       sed -i "/location \/_matrix {/i\    include /etc/nginx/snippets/synapse-hardening.conf;" /etc/nginx/sites-available/matrix
     fi
-    nginx -t && systemctl reload nginx
+    nginx -t && svc_reload nginx
   fi
   echo "  Fail2ban and nginx hardening applied."
 }
@@ -764,7 +863,7 @@ sed -i "s|@admin:$SERVER_NAME|$BRIDGE_ADMIN|g" /opt/discord-bridge/config.yaml
       echo "  - /etc/matrix-synapse/discord-registration.yaml" >> /etc/matrix-synapse/conf.d/50-appservice-discord.yaml
     fi
     chown matrix-synapse:matrix-synapse /etc/matrix-synapse/conf.d/50-appservice-discord.yaml /etc/matrix-synapse/discord-registration.yaml
-    systemctl restart matrix-synapse
+    svc_restart matrix-synapse
     echo "  Discord bridge registration added to Synapse. Start the bridge: cd /opt/discord-bridge && node index.js (or use Docker)."
   else
     echo "  Could not generate Discord registration (npx not found or bridge failed). Create Discord app, get bot token, then run: npx matrix-appservice-discord -r -u http://localhost:9005 -c /opt/discord-bridge/config.yaml and copy output to /etc/matrix-synapse/discord-registration.yaml, add app_service_config_files to Synapse conf.d, restart Synapse."
