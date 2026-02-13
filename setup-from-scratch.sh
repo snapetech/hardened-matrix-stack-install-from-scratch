@@ -690,7 +690,8 @@ setup_fail2ban_nginx_hardening() {
     systemctl enable fail2ban && systemctl start fail2ban 2>/dev/null || true
     fail2ban-client reload 2>/dev/null || true
   fi
-  # Rate-limit zones + hardening snippet (admin/metrics lockdown, rate-limited login)
+  # Rate-limit zones + hardening snippet (admin/metrics lockdown, rate-limited login).
+  # Hardening allows /_synapse/admin from 127.0.0.1, ::1, and 172.17.0.0/16 so Mjolnir in Docker can call admin API.
   if [ -f "$REPO_DIR/nginx-synapse-rate-limit-zones.conf" ]; then
     mkdir -p /etc/nginx/conf.d /etc/nginx/snippets
     cp "$REPO_DIR/nginx-synapse-rate-limit-zones.conf" /etc/nginx/conf.d/
