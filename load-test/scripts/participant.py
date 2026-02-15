@@ -16,6 +16,37 @@ MAX_429_WAIT_SEC = 120
 MAX_429_RETRIES = 15
 
 
+# One sentence per 15s; rotate through these during the run
+LOADTEST_SENTENCES = [
+    "Load test participant sending a message.",
+    "Audio and video are being published to the call.",
+    "Matrix room message from the ramp test.",
+    "Checking that the server handles mixed media and chat.",
+    "This is a synthetic message every 15 seconds.",
+    "Ramp test in progress; all participants should be under TX and RX load.",
+    "If you see this in the room, the test is sending text as well as A/V.",
+]
+
+
+def _put_with_429_retry(url: str, *, headers=None, json_data=None, timeout=15) -> requests.Response:
+    """PUT once or retry after 429 using retry_after_ms."""
+    total_waited = 0.0
+    for _ in range(MAX_429_RETRIES):
+        r = requests.put(url, headers=headers or {}, json=json_data, timeout=timeout)
+        if r.status_code != 429:
+            return r
+        try:
+            wait_ms = int(r.json().get("retry_after_ms", 5000))
+        except Exception:
+            wait_ms = 5000
+        wait_sec = min(wait_ms / 1000.0, MAX_429_WAIT_SEC - total_waited)
+        if wait_sec <= 0:
+            return r
+        time.sleep(wait_sec)
+        total_waited += wait_sec
+    return r
+
+
 def _post_with_429_retry(url: str, *, headers=None, json_data=None, timeout=15) -> requests.Response:
     """POST once or retry after 429 using retry_after_ms."""
     total_waited = 0.0
@@ -66,6 +97,18 @@ def get_openid_token(server_url: str, access_token: str, user_id: str) -> dict:
     )
     r.raise_for_status()
     return r.json()
+
+
+def matrix_send_message(server_url: str, access_token: str, room_id: str, body: str, txn_id: str) -> None:
+    """Send one m.room.message to the room. Retries on 429."""
+    url = urljoin(server_url, f"/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}")
+    r = _put_with_429_retry(
+        url,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json_data={"msgtype": "m.text", "body": body},
+        timeout=15,
+    )
+    r.raise_for_status()
 
 
 def get_livekit_token(
@@ -146,7 +189,61 @@ async def run_participant(
     await room.local_participant.publish_track(audio_track, options)
     await room.local_participant.publish_track(video_track, options)
 
-    # 6) Push synthetic audio in a loop (async)
+    # 5b) Wait for at least one remote to have subscribed audio and video (RX load)
+    #    Skip when we are the only participant (no remotes).
+    rx_timeout = 30.0
+    rx_interval = 0.5
+    elapsed = 0.0
+    while elapsed < rx_timeout:
+        has_audio = has_video = False
+        for remote in room.remote_participants.values():
+            for pub in remote.track_publications.values():
+                if getattr(pub, "track", None) is None:
+                    continue
+                try:
+                    k = getattr(pub, "kind", None)
+                    if k == rtc.TrackKind.KIND_AUDIO:
+                        has_audio = True
+                    elif k == rtc.TrackKind.KIND_VIDEO:
+                        has_video = True
+                except Exception:
+                    pass
+        if room.remote_participants and (has_audio and has_video):
+            break
+        if not room.remote_participants:
+            # Solo participant: no RX check required
+            break
+        await asyncio.sleep(rx_interval)
+        elapsed += rx_interval
+    if room.remote_participants and not (has_audio and has_video):
+        await room.disconnect()
+        raise RuntimeError(
+            f"RX validation failed: after {rx_timeout}s no remote A/V received "
+            "(need both subscribed audio and video from remotes)"
+        )
+
+    # 6) Matrix text: one sentence every 15s (run sync HTTP in executor)
+    message_index = [0]  # mutable so closure can update
+
+    def send_one_message():
+        idx = message_index[0] % len(LOADTEST_SENTENCES)
+        message_index[0] += 1
+        body = LOADTEST_SENTENCES[idx]
+        txn_id = f"loadtest-{user_id}-{int(time.time() * 1000)}"
+        matrix_send_message(server_url, access_token, room_id, body, txn_id)
+
+    async def text_loop():
+        loop = asyncio.get_event_loop()
+        while not safety_triggered():
+            await loop.run_in_executor(None, send_one_message)
+            for _ in range(150):  # 15s in 0.1s steps so we can check safety
+                if safety_triggered():
+                    return
+                await asyncio.sleep(0.1)
+
+    text_task = asyncio.create_task(text_loop())
+
+    # 7) Push synthetic audio in a loop (async)
     async def push_audio():
         for chunk in sine_audio_frames():
             if safety_triggered():
@@ -155,7 +252,7 @@ async def run_participant(
             await audio_source.capture_frame(frame)
             await asyncio.sleep(0.02)  # ~20ms
 
-    # 7) Push synthetic video in a loop (sync capture_frame)
+    # 8) Push synthetic video in a loop (sync capture_frame)
     def push_video():
         import time as _t
         start = _t.monotonic()
@@ -178,16 +275,14 @@ async def run_participant(
     try:
         await asyncio.sleep(duration_seconds)
     finally:
+        text_task.cancel()
         audio_task.cancel()
         video_task.cancel()
-        try:
-            await audio_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await video_task
-        except asyncio.CancelledError:
-            pass
+        for t in (text_task, audio_task, video_task):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         await room.disconnect()
 
 
