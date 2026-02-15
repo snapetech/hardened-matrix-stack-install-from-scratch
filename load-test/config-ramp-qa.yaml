@@ -1,0 +1,13 @@
+server_url: "http://localhost:30048"
+server_name: "qa.local"
+admin_user_id: "@ramp-1211092:qa.local"
+admin_access_token: "syt_cmFtcC0xMjExMDky_LSjyYxZGgPxNQUWhtSvT_4UDyZG"
+admin_api_token: "syt_cmFtcC0xMjExMDky_LSjyYxZGgPxNQUWhtSvT_4UDyZG"
+livekit_ws_url: "ws://localhost:30049"
+livekit_jwt_url: "http://localhost:30050"
+test_users_file: "test_users.json"
+participants: 10
+duration_seconds: 120
+safety:
+  load1_max: 20
+  consecutive_errors_max: 10
