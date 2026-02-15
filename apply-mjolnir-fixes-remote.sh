@@ -1,6 +1,8 @@
 #!/bin/bash
 # Apply nginx fix: allow Docker bridge for /_synapse/admin so Mjolnir can call admin API (fix 403).
-# Run: (secret-tool lookup service sudo-remote user "lukano@timeways.net"; echo; cat apply-mjolnir-fixes-remote.sh) | ssh lukano@timeways.net 'sudo -S -p "" bash -s'
+#
+# Run once (do not retry on failure; fix cause first to avoid fail2ban):
+#   ./run-remote-sudo.sh lukano@timeways.net apply-mjolnir-fixes-remote.sh
 set -e
 echo "[1] Update nginx synapse-hardening snippet (allow Docker bridge for /_synapse/admin)..."
 if [ -f /home/lukano/nginx-synapse-hardening.conf ]; then

@@ -1,6 +1,6 @@
 # Hardened Matrix stack — install from scratch
 
-One script to install and configure a full **hardened Matrix** stack on a fresh Debian/Ubuntu server: Synapse, Postgres, nginx, TLS (Let's Encrypt), coturn, Prometheus + Grafana (optionally gated behind Synapse login), fail2ban, backup cron, **Element Call (LiveKit Docker)**, **Mjolnir**, **Maubot**, and **Discord bridge**. Everything is driven by the script; no “deploy separately” steps.
+One script to install and configure a full **hardened Matrix** stack on a fresh Debian/Ubuntu server: Synapse, Postgres, nginx, TLS (Let's Encrypt), coturn, **monitoring (Netdata OR Prometheus, not both**, optionally gated behind Synapse login), fail2ban, backup cron, **Element Call (LiveKit Docker)**, **moderation bot (Draupnir OR Mjolnir, or none)**, **Maubot**, and **Discord bridge**. Everything is driven by the script; no “deploy separately” steps.
 
 ## Requirements
 
@@ -27,14 +27,14 @@ The script prompts for:
 | **Email for Let's Encrypt** | `admin@example.com` | Cert expiry and recovery. |
 | **Enable federation?** | n | Open to other Matrix servers or client-only. |
 | **Install coturn?** | y | TURN/STUN for voice and video. |
-| **Install Prometheus + Grafana?** | y | Metrics and dashboards. |
+| **Monitoring backend** | netdata | (n)one / (net)data / (prom)etheus — exactly one. |
 | **Install Element Call / LiveKit?** | n | Docker-based voice/video SFU (MatrixRTC). |
 | **Install fail2ban?** | y | Ban IPs after repeated login failures. |
 | **Install backup script and cron?** | y | Daily backup at 03:00. |
-| **Install Mjolnir?** | n | Moderation bot (Docker). |
+| **Moderation bot** | none | (n)one / (d)raupnir / (m)jolnir — Draupnir is the recommended successor to Mjolnir. |
 | **Install Maubot?** | n | Plugin bot. |
 | **Install Discord bridge?** | n | Appservice bridge. |
-| **Gate Prometheus/Grafana behind Synapse login?** | y | metrics-auth proxy (when monitoring is installed). |
+| **Gate metrics behind Synapse login?** | y | metrics-auth proxy (when monitoring is installed). |
 | **First admin user (localpart)** | admin | Creates `@admin:example.com` (password prompted). |
 
 ## What gets installed (all in one script)
@@ -43,12 +43,12 @@ The script prompts for:
 2. **Synapse:** Matrix.org repo, Postgres DB, conf.d (server_name, registration off, listener, url_preview off, ip_blacklist, no-federation if desired).
 3. **nginx + TLS:** Certbot, Matrix site (proxy to Synapse), optional root domain well-known.
 4. **Coturn:** TURN secret, Synapse `turn.yaml`, coturn enabled.
-5. **Monitoring (optional):** Prometheus + node exporter, Grafana; scrape config, alerts, recording rules; Grafana provisioning (dashboard + datasource).
-6. **Metrics-auth (optional, when monitoring=y):** Python proxy on 127.0.0.1:9091; nginx locations for `/metrics-auth/` (login/validate) and gated `/metrics/` and `/metrics/grafana/`; Prometheus bound to localhost with external-url; Grafana subpath.
+5. **Monitoring (optional, one of):** **Netdata** (real-time metrics) or **Prometheus** (+ node_exporter); bound to localhost when gated. Only one backend is installed.
+6. **Metrics-auth (optional, when monitoring installed):** Python proxy on 127.0.0.1:9091; nginx locations for `/metrics-auth/` (login/validate) and gated `/metrics/` (Netdata or Prometheus UI); login with Matrix account.
 7. **Element Call (optional):** Docker + LiveKit server + lk-jwt-service; `/opt/element-call` with `docker-compose.yml`, `livekit.yaml`, `.env`; nginx `/livekit/jwt` and `/livekit/sfu`; Synapse experimental MSCs (3266, 4222, 4140) and `.well-known` rtc_foci.
 8. **Fail2ban + nginx hardening:** Filter/jail for Synapse auth; rate-limit zones and hardening snippet.
 9. **Backup:** `/opt/matrix-backup/backup-matrix.sh` and cron at 03:00.
-10. **Mjolnir (optional):** Creates `@mjolnir:SERVER_NAME`, management room, token; writes `/opt/mjolnir/config/production.yaml`; runs Mjolnir in Docker.
+10. **Moderation bot (optional, one of):** **Draupnir** (recommended) or **Mjolnir**; creates `@draupnir` or `@mjolnir:SERVER_NAME`, management room, token; runs in Docker. See [DRAUPNIR-INTEGRATION.md](DRAUPNIR-INTEGRATION.md) for remote activation.
 11. **Maubot (optional):** Creates `@maubot:SERVER_NAME`; writes `/opt/maubot/config.yaml`. You run Maubot (pip or Docker) yourself.
 12. **Discord bridge (optional):** Writes `/opt/discord-bridge/config.yaml`; if `npx` is available, generates registration and adds Synapse appservice config; you start the bridge (Node or Docker).
 
@@ -77,13 +77,13 @@ See **[k8s-qa/README.md](k8s-qa/README.md)** for deploy, access (NodePort / port
 - **setup-from-scratch.sh** — Main script (run as root).
 - **run-qa-noninteractive.sh** — Wrapper for non-interactive/QA (sets `NON_INTERACTIVE=1`, `USE_SELF_SIGNED_CERT=1`, runs setup-from-scratch.sh).
 - **SETUP-FROM-SCRATCH.md** — Detailed setup and prompts.
-- **backup-matrix.sh** — Backup script (Synapse DB, media, conf.d, server config including Element Call, Mjolnir, Maubot, Discord).
+- **backup-matrix.sh** — Backup script (Synapse DB, media, conf.d, server config including Element Call, Draupnir/Mjolnir, Maubot, Discord).
 - **element-call/** — `docker-compose.yml` and `livekit.yaml.template` for Element Call / LiveKit.
 - **synapse-*.yaml**, **nginx-*.conf** — Config snippets and templates.
 - **fail2ban-matrix/** — Filter and jail for Synapse auth.
-- **grafana/** — Provisioning (datasources, dashboards) and conf.d.
-- **prometheus-*.yml** — Prometheus config, alerts, recording rules.
-- **metrics-auth-proxy.py**, **metrics-auth-proxy.service** — Gated metrics behind Synapse login.
+- **netdata/** — Netdata bind-to-localhost config for use behind nginx.
+- **metrics-auth-proxy.py**, **metrics-auth-proxy.service** — Gated metrics (Netdata or Prometheus) behind Synapse login.
+- **draupnir-production.yaml**, **setup-draupnir.sh**, **apply-draupnir-remote.sh** — Draupnir (moderation bot) config template, standalone setup, and remote deploy. See [DRAUPNIR-INTEGRATION.md](DRAUPNIR-INTEGRATION.md).
 - **mjolnir-production.yaml**, **setup-mjolnir.sh** — Mjolnir config template and standalone setup helper.
 - **maubot-patch.yaml**, **setup-maubot-user.sh** — Maubot config and user-creation helper.
 - **discord-bridge-config.yaml**, **synapse-appservice-discord.yaml** — Discord bridge template and Synapse appservice include.
@@ -97,6 +97,15 @@ See **[k8s-qa/README.md](k8s-qa/README.md)** for deploy, access (NodePort / port
 - **Metrics (if gated):** Open `https://<matrix-domain>/metrics/` and log in with your Matrix account.
 - **Element Call:** If installed, clients that support MatrixRTC (e.g. Element X) will use your LiveKit backend via `.well-known` rtc_foci.
 - **Lock-down (optional):** Remove `registration_shared_secret` from Synapse `conf.d/registration.yaml` after creating all initial accounts.
+
+## Remote commands in screen
+
+For long-running or one-off remote commands (e.g. load test, deploys), use **screen** so you can attach and monitor. Sudo still uses `run-remote-sudo.sh` (one shot, no retries).
+
+- **Non-sudo:** `./run-remote-in-screen.sh lukano@timeways.net <session_name> [-w] -- <command>`  
+  Or pipe a script: `cat script.sh | ./run-remote-in-screen.sh lukano@timeways.net <session_name> [-w]`  
+  Attach: `ssh lukano@timeways.net` then `screen -r <session_name>`. With `-w`, the script waits for the screen to exit then runs `screen -wipe`.
+- **Sudo (once, no retries):** `./run-remote-sudo.sh lukano@timeways.net script.sh`
 
 ## License
 

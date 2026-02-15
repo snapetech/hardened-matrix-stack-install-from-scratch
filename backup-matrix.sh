@@ -5,7 +5,7 @@
 #   - server signing key
 #   - conf.d/ (all Synapse conf.d including database.yaml, registration.yaml — chmod 600 on secrets)
 #   - optional setupdocs/ (if SETUPDOCS_PATH or /opt/matrix-backup/setupdocs exists; sync from local ~/setupdocs)
-#   - server_config/ (Prometheus, Grafana, nginx, Element Call including .env, TURN secret, Mjolnir/Maubot/Discord configs, well-known, coturn, Synapse homeserver.yaml, backup script)
+#   - server_config/ (Netdata, nginx, Element Call including .env, TURN secret, Mjolnir/Maubot/Discord configs, well-known, coturn, Synapse homeserver.yaml, backup script)
 #   - optional k8s/ (with --k8s-friendly)
 # Backup is full-secrets: protect the backup dir (0700) and any fetched copy (encrypt, restrict access). See BACKUP-CONTENTS.md.
 # Run on server (e.g. cron daily). Then fetch-backups.sh to pull to local.
@@ -61,18 +61,14 @@ if [ -d "$SETUPDOCS" ]; then
   echo "Included setup docs from $SETUPDOCS"
 fi
 
-# 6) Server config (Prometheus, Grafana, nginx, Element Call, well-known, coturn, Synapse main, secrets)
+# 6) Server config (Netdata, nginx, Element Call, well-known, coturn, Synapse main, secrets)
 #    Includes secrets (TURN, Element Call .env, Mjolnir/Maubot/Discord configs) so one backup = full restore.
 #    Backup dir is root-only (0700); protect any fetched copy (e.g. encrypt, restrict access).
 SC="$DEST/server_config"
 mkdir -p "$SC"
-# Prometheus
-[ -d /etc/prometheus ] && mkdir -p "$SC/prometheus" && cp -a /etc/prometheus/*.yml "$SC/prometheus/" 2>/dev/null || true
-[ -f /etc/default/prometheus ] && cp -a /etc/default/prometheus "$SC/prometheus.default" 2>/dev/null || true
-# Grafana (provisioning + conf.d; no DB)
-mkdir -p "$SC/grafana"
-[ -d /etc/grafana/provisioning ] && cp -a /etc/grafana/provisioning "$SC/grafana/" 2>/dev/null || true
-[ -d /etc/grafana/conf.d ] && cp -a /etc/grafana/conf.d "$SC/grafana/" 2>/dev/null || true
+# Netdata (bind-localhost and any custom config)
+[ -d /etc/netdata ] && mkdir -p "$SC/netdata" && cp -a /etc/netdata/netdata.conf.d "$SC/netdata/" 2>/dev/null || true
+[ -f /etc/netdata/netdata.conf ] && cp -a /etc/netdata/netdata.conf "$SC/netdata/" 2>/dev/null || true
 # Nginx (sites, conf.d, snippets — matrix, root-wellknown, security, rate-limit, well-known, metrics)
 mkdir -p "$SC/nginx"
 [ -f /etc/nginx/sites-available/matrix ] && cp -a /etc/nginx/sites-available/matrix "$SC/nginx/" 2>/dev/null || true
@@ -86,6 +82,8 @@ mkdir -p "$SC/nginx"
 [ -f /root/.matrix-turn-secret ] && cp -a /root/.matrix-turn-secret "$SC/turn-secret" && chmod 600 "$SC/turn-secret" 2>/dev/null || true
 # Mjolnir (Docker: config with accessToken + managementRoom — full restorable)
 [ -d /opt/mjolnir/config ] && mkdir -p "$SC/mjolnir" && cp -a /opt/mjolnir/config "$SC/mjolnir/" 2>/dev/null && find "$SC/mjolnir" -type f -exec chmod 600 {} \; 2>/dev/null || true
+# Draupnir (Docker: config with accessToken + managementRoom — full restorable)
+[ -d /opt/draupnir/config ] && mkdir -p "$SC/draupnir" && cp -a /opt/draupnir/config "$SC/draupnir/" 2>/dev/null && find "$SC/draupnir" -type f -exec chmod 600 {} \; 2>/dev/null || true
 # Maubot (Docker: config.yaml with password — full restorable)
 [ -f /opt/maubot/config.yaml ] && mkdir -p "$SC/maubot" && cp -a /opt/maubot/config.yaml "$SC/maubot/" && chmod 600 "$SC/maubot/config.yaml" 2>/dev/null || true
 # Discord bridge (Docker: config.yaml with bot token; registration in Synapse conf.d or server_config)
@@ -104,7 +102,7 @@ mkdir -p "$SC/nginx"
 mkdir -p "$SC/fail2ban"
 [ -f /etc/fail2ban/filter.d/matrix-synapse-auth.conf ] && cp -a /etc/fail2ban/filter.d/matrix-synapse-auth.conf "$SC/fail2ban/filter-matrix-synapse-auth.conf" 2>/dev/null || true
 [ -f /etc/fail2ban/jail.d/matrix-synapse-auth.conf ] && cp -a /etc/fail2ban/jail.d/matrix-synapse-auth.conf "$SC/fail2ban/jail-matrix-synapse-auth.conf" 2>/dev/null || true
-[ -n "$(ls -A "$SC" 2>/dev/null)" ] && echo "Included server_config (prometheus, grafana, nginx, element-call, well-known, coturn, synapse, backup script, fail2ban)"
+[ -n "$(ls -A "$SC" 2>/dev/null)" ] && echo "Included server_config (netdata, nginx, element-call, well-known, coturn, synapse, backup script, fail2ban)"
 
 # 7) Optional: k8s-friendly manifests (--k8s-friendly)
 if [ -n "$K8S_FRIENDLY" ]; then

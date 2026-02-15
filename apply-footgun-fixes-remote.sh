@@ -1,9 +1,11 @@
 #!/bin/bash
 # Apply footgun fixes on an already-running Matrix host.
-# Run with (password must end with newline for sudo -S):
-#   (secret-tool lookup service sudo-remote user "lukano@timeways.net"; echo; cat apply-footgun-fixes-remote.sh) | ssh lukano@timeways.net 'sudo -S -p "" bash -s'
-# With files in lukano's home: (secret-tool ...; echo; echo 'REPO_DIR=/home/lukano'; cat apply-footgun-fixes-remote.sh) | ssh ...
-# Or run on host: sudo REPO_DIR=/path/to/repo bash apply-footgun-fixes-remote.sh
+#
+# Run once (do not retry on failure; fix cause first to avoid fail2ban):
+#   ./run-remote-sudo.sh lukano@timeways.net apply-footgun-fixes-remote.sh
+# Or with REPO_DIR set on remote: (echo 'REPO_DIR=/home/lukano'; cat apply-footgun-fixes-remote.sh) | ./run-remote-sudo.sh lukano@timeways.net
+#
+# Or on the host: sudo REPO_DIR=/path/to/repo bash apply-footgun-fixes-remote.sh
 set -e
 REPO_DIR="${REPO_DIR:-$HOME}"
 [ -f "$REPO_DIR/docker-compose.yml" ] && EC_SOURCE="$REPO_DIR/docker-compose.yml" || EC_SOURCE="$REPO_DIR/element-call/docker-compose.yml"
@@ -23,12 +25,12 @@ else
   echo "  Federation disabled: leaving 44-no-federation.yaml as-is"
 fi
 
-echo "[3] Nginx: add metrics-grafana and element-call includes if missing (match listen 443 ssl http2;)..."
+echo "[3] Nginx: add metrics-netdata and element-call includes if missing (match listen 443 ssl http2;)..."
 MATRIX_VHOST="/etc/nginx/sites-available/matrix"
-if ! grep -q "metrics-grafana.conf" "$MATRIX_VHOST" 2>/dev/null; then
-  if [ -f /etc/nginx/snippets/metrics-grafana.conf ]; then
-    sed -i '/listen 443 ssl http2;/a\    include /etc/nginx/snippets/metrics-grafana.conf;' "$MATRIX_VHOST"
-    echo "  Added metrics-grafana include"
+if ! grep -q "metrics-netdata.conf" "$MATRIX_VHOST" 2>/dev/null; then
+  if [ -f /etc/nginx/snippets/metrics-netdata.conf ]; then
+    sed -i '/listen 443 ssl http2;/a\    include /etc/nginx/snippets/metrics-netdata.conf;' "$MATRIX_VHOST"
+    echo "  Added metrics-netdata include"
   fi
 fi
 if ! grep -q "element-call-livekit.conf" "$MATRIX_VHOST" 2>/dev/null; then
@@ -51,32 +53,28 @@ else
   echo "  Livekit snippet already has redirects or missing"
 fi
 
-echo "[5] Grafana: remove anonymous.ini if metrics-auth not in use..."
-if ! grep -q "metrics-auth/validate" "$MATRIX_VHOST" 2>/dev/null; then
-  rm -f /etc/grafana/conf.d/anonymous.ini
-  echo "  Removed Grafana anonymous (no metrics gating)"
-else
-  echo "  Metrics-auth in use: keeping Grafana anonymous"
+echo "[5] Netdata: ensure bound to localhost and restart if metrics-auth in use..."
+if grep -q "metrics-auth/validate" "$MATRIX_VHOST" 2>/dev/null && [ -d /etc/netdata ]; then
+  if [ -d /etc/netdata/netdata.conf.d ] && [ ! -f /etc/netdata/netdata.conf.d/bind-localhost.conf ]; then
+    printf '[web]\n    bind socket to IP = 127.0.0.1\n' > /etc/netdata/netdata.conf.d/bind-localhost.conf
+    echo "  Netdata: added bind to 127.0.0.1"
+  fi
+  systemctl restart netdata 2>/dev/null || true
+  echo "  Netdata restarted"
 fi
 
-echo "[6] Prometheus: ensure bound to localhost and restart..."
-if [ -f /etc/default/prometheus ] && grep -q "web.listen-address" /etc/default/prometheus 2>/dev/null; then
-  systemctl restart prometheus 2>/dev/null || true
-  echo "  Prometheus restarted"
-fi
-
-echo "[7] Nginx test and reload..."
+echo "[6] Nginx test and reload..."
 nginx -t && systemctl reload nginx
 echo "  Nginx reloaded"
 
-echo "[8] Element Call: restart Docker stack with new port bindings..."
+echo "[7] Element Call: restart Docker stack with new port bindings..."
 if [ -d /opt/element-call ]; then
   (cd /opt/element-call && (docker compose down 2>/dev/null || docker-compose down 2>/dev/null) || true)
   (cd /opt/element-call && (docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null) || true)
   echo "  Element Call containers restarted"
 fi
 
-echo "[9] Synapse: restart if we removed federation file..."
+echo "[8] Synapse: restart if we removed federation file..."
 if [ -f /etc/matrix-synapse/conf.d/44-no-federation.yaml ]; then
   echo "  (no synapse restart needed)"
 else

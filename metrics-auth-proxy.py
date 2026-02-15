@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Minimal auth proxy for Prometheus/Grafana: gate behind Synapse login.
-Serves: /login (form), /login (POST -> Synapse, set cookie, redirect), /validate (for nginx auth_request).
-Run on 127.0.0.1:9091; nginx auth_request calls /validate and proxies /metrics/ to Prometheus.
+Minimal auth proxy for Netdata (or other metrics): gate behind Synapse login.
+Serves: /metrics-auth/ (login form), POST login -> Synapse, set cookie, redirect; /metrics-auth/validate for nginx auth_request.
+Run on 127.0.0.1:9091; nginx auth_request calls /validate and proxies /metrics/ to Netdata (or Prometheus).
 Requires: SYNAPSE_URL (e.g. https://matrix.example.com), COOKIE_NAME (default metrics_session).
 """
 import os
@@ -12,34 +12,54 @@ import urllib.parse
 import json
 import ssl
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import Optional
 
+# Use SYNAPSE_INTERNAL_URL (e.g. http://127.0.0.1:8008) to talk to Synapse directly; avoids SSL/DNS when proxy runs on same host.
+SYNAPSE_INTERNAL_URL = os.environ.get("SYNAPSE_INTERNAL_URL", "").rstrip("/")
 SYNAPSE_URL = os.environ.get("SYNAPSE_URL", "https://matrix.example.com").rstrip("/")
+SYNAPSE_BASE = SYNAPSE_INTERNAL_URL if SYNAPSE_INTERNAL_URL else SYNAPSE_URL
 COOKIE_NAME = os.environ.get("COOKIE_NAME", "metrics_session")
 LISTEN = os.environ.get("LISTEN", "127.0.0.1:9091")
 METRICS_PATH = os.environ.get("METRICS_PATH", "/metrics/")
 
 
+def _ssl_context():
+    if SYNAPSE_BASE.startswith("https://"):
+        return ssl.create_default_context()
+    return None  # no SSL for http://
+
+
+def _request_synapse(path: str, method: str = "GET", data: Optional[bytes] = None, headers: Optional[dict] = None):
+    url = f"{SYNAPSE_BASE}{path}"
+    h = dict(headers or {})
+    if not SYNAPSE_INTERNAL_URL and SYNAPSE_URL:
+        host = urllib.parse.urlparse(SYNAPSE_URL).netloc
+        if host:
+            h["Host"] = host
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    ctx = _ssl_context()
+    if ctx is not None:
+        return urllib.request.urlopen(req, timeout=10, context=ctx)
+    return urllib.request.urlopen(req, timeout=10)
+
+
 def login_synapse(user: str, password: str):
-    req = urllib.request.Request(
-        f"{SYNAPSE_URL}/_matrix/client/r0/login",
-        data=json.dumps({"type": "m.login.password", "user": user, "password": password}).encode(),
-        headers={"Content-Type": "application/json"},
+    body = json.dumps({"type": "m.login.password", "user": user, "password": password}).encode()
+    with _request_synapse(
+        "/_matrix/client/r0/login",
         method="POST",
-    )
-    ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+        data=body,
+        headers={"Content-Type": "application/json"},
+    ) as r:
         return json.loads(r.read())
 
 
 def whoami(token: str) -> bool:
-    req = urllib.request.Request(
-        f"{SYNAPSE_URL}/_matrix/client/v3/account/whoami",
-        headers={"Authorization": f"Bearer {token}"},
-        method="GET",
-    )
-    ctx = ssl.create_default_context()
     try:
-        with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+        with _request_synapse(
+            "/_matrix/client/v3/account/whoami",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as r:
             return r.status == 200
     except urllib.error.HTTPError as e:
         return e.code == 200
@@ -135,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Set cookie with token (httpOnly, Secure in production)
         cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400"
-        if SYNAPSE_URL.startswith("https"):
+        if (SYNAPSE_URL or SYNAPSE_BASE).startswith("https"):
             cookie += "; Secure"
         self.send_response(302)
         self.send_header("Location", METRICS_PATH)
@@ -143,13 +163,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def send_validate(self):
-        cookie_header = self.headers.get("Cookie", "")
-        token = parse_cookie(cookie_header)
-        if token and whoami(token):
-            self.send_response(200)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-        else:
+        try:
+            cookie_header = self.headers.get("Cookie", "")
+            token = parse_cookie(cookie_header)
+            if token and whoami(token):
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+        except Exception:
             self.send_response(401)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -174,7 +199,7 @@ def main():
     host, _, port = LISTEN.rpartition(":")
     port = int(port or "9091")
     server = HTTPServer((host or "127.0.0.1", port), Handler)
-    print(f"Metrics auth proxy on http://{host or '127.0.0.1'}:{port} (Synapse: {SYNAPSE_URL})")
+    print(f"Metrics auth proxy on http://{host or '127.0.0.1'}:{port} (Synapse: {SYNAPSE_BASE})")
     server.serve_forever()
 
 

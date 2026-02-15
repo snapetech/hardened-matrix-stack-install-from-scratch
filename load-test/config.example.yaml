@@ -1,0 +1,38 @@
+# Copy to config.yaml and fill in. Do not commit config.yaml or test_users.json.
+#
+# Private E2EE test room: only admin_user_id + test bots can access.
+# The script creates this room (or uses test_room_id if set) and invites only the bots.
+
+server_url: "https://matrix.timeways.net"
+server_name: "timeways.net"   # MXID domain
+
+# Admin (lukano) - used to create the private E2EE room and invite bots. Must be in the room.
+admin_user_id: "@lukano:timeways.net"
+# Admin access token (or set ADMIN_ACCESS_TOKEN in env). Get from Element: Settings -> Help & About -> Access Token.
+admin_access_token: ""
+
+# Optional: use existing test room (private, E2EE, only you + bots). If unset, script creates one.
+# test_room_id: "!xxx:timeways.net"
+
+# LiveKit (Element Call)
+livekit_ws_url: "wss://matrix.timeways.net/livekit/sfu"
+livekit_jwt_url: "https://matrix.timeways.net/livekit/jwt/"
+
+# Synapse Admin API - to create test users. Requires admin token.
+# Same as admin_access_token if lukano is admin.
+admin_api_token: ""
+
+# Test parameters
+participants: 5
+duration_seconds: 120
+
+# Safety: stop and kill all bots if threshold exceeded (protect human users).
+safety:
+  load1_max: 10
+  consecutive_errors_max: 5
+  prometheus_url: ""   # optional; Netdata at /metrics/ doesn't expose Prometheus API—use safety_load_ssh for load
+  # When running orchestrator from LOCAL machine, set so safety reads server load via SSH:
+  safety_load_ssh: "lukano@timeways.net"
+
+# Optional: reuse existing test users from file (skip creation).
+# test_users_file: "test_users.json"

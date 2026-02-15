@@ -1,0 +1,11 @@
+# Draupnir config template. Replace accessToken and managementRoom after running setup-draupnir.sh.
+# Setup script seds example.com and matrix.example.com to your SERVER_NAME and MATRIX_DOMAIN.
+homeserverUrl: "https://matrix.example.com"
+rawHomeserverUrl: "https://matrix.example.com"
+accessToken: "REPLACE_AFTER_SETUP"
+managementRoom: "!REPLACE:example.com"
+dataPath: "/data/storage"
+autojoinOnlyIfManager: true
+logLevel: "INFO"
+verifyPermissionsOnStartup: true
+noop: false

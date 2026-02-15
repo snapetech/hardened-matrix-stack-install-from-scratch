@@ -1,10 +1,12 @@
 [Unit]
-Description=Metrics auth proxy (Synapse login gate for Prometheus)
-After=network.target
+Description=Metrics auth proxy (Synapse login gate for Netdata)
+After=network.target matrix-synapse.service
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 /opt/metrics-auth/metrics-auth-proxy.py
+# Prefer internal URL so proxy talks to Synapse directly (no SSL/DNS on same host)
+Environment=SYNAPSE_INTERNAL_URL=http://127.0.0.1:8008
 Environment=SYNAPSE_URL=https://matrix.example.com
 Environment=LISTEN=127.0.0.1:9091
 WorkingDirectory=/opt/metrics-auth

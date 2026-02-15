@@ -1,8 +1,8 @@
 #!/bin/bash
 # First-time Matrix stack setup for a fresh server (Debian/Ubuntu).
 # Installs and configures: Postgres, Synapse, nginx, TLS (certbot), coturn,
-# Prometheus, Grafana, metrics-auth proxy, fail2ban, backup cron,
-# Element Call (LiveKit Docker), Mjolnir, Maubot, Discord bridge.
+# monitoring (Netdata OR Prometheus, not both), metrics-auth proxy, fail2ban, backup cron,
+# Element Call (LiveKit Docker), moderation bot (Draupnir OR Mjolnir, or none), Maubot, Discord bridge.
 # Prompts interactively for domain, server name, email, and options.
 #
 # Usage: sudo ./setup-from-scratch.sh
@@ -23,11 +23,13 @@ ROOT_DOMAIN="${ROOT_DOMAIN:-}"
 LE_EMAIL="${LE_EMAIL:-}"
 FEDERATION="${FEDERATION:-n}"
 INSTALL_COTURN="${INSTALL_COTURN:-y}"
-INSTALL_MONITORING="${INSTALL_MONITORING:-y}"
+# Monitoring: exactly one of none, netdata, prometheus
+MONITORING_BACKEND="${MONITORING_BACKEND:-netdata}"
 INSTALL_ELEMENT_CALL="${INSTALL_ELEMENT_CALL:-n}"
 INSTALL_FAIL2BAN="${INSTALL_FAIL2BAN:-y}"
 INSTALL_BACKUP_CRON="${INSTALL_BACKUP_CRON:-y}"
-INSTALL_MJOLNIR="${INSTALL_MJOLNIR:-n}"
+# Moderation bot: exactly one of none, mjolnir, draupnir
+INSTALL_MODERATION_BOT="${INSTALL_MODERATION_BOT:-none}"
 INSTALL_MAUBOT="${INSTALL_MAUBOT:-n}"
 INSTALL_DISCORD="${INSTALL_DISCORD:-n}"
 INSTALL_METRICS_AUTH="${INSTALL_METRICS_AUTH:-y}"
@@ -113,9 +115,7 @@ svc_start() {
         done
         ;;
       coturn) cmd=$(command -v turnserver 2>/dev/null) && [ -x "$cmd" ] && ($cmd -c /etc/turnserver.conf --daemon 2>/dev/null || true) || true ;;
-      prometheus) [ -x /usr/bin/prometheus ] && (prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/var/lib/prometheus --web.listen-address=127.0.0.1:9090 &) 2>/dev/null || true ;;
-      prometheus-node-exporter) [ -x /usr/bin/prometheus-node-exporter ] && (prometheus-node-exporter &) 2>/dev/null || true ;;
-      grafana-server) [ -x /usr/sbin/grafana-server ] && (grafana-server --homepath=/usr/share/grafana &) 2>/dev/null || true ;;
+      netdata) [ -x /usr/sbin/netdata ] && (netdata -D &) 2>/dev/null || true ;;
       metrics-auth-proxy) [ -x /opt/metrics-auth/metrics-auth-proxy.py ] && (python3 /opt/metrics-auth/metrics-auth-proxy.py &) 2>/dev/null || true ;;
       fail2ban) fail2ban-client start 2>/dev/null || true ;;
       docker) [ -x /usr/bin/dockerd ] && (dockerd &) 2>/dev/null || true ;;
@@ -160,13 +160,20 @@ run_prompts() {
     SERVER_NAME="${SERVER_NAME:-example.com}"
     ROOT_DOMAIN="${ROOT_DOMAIN:-$SERVER_NAME}"
     LE_EMAIL="${LE_EMAIL:-admin@$SERVER_NAME}"
-    for v in FEDERATION INSTALL_COTURN INSTALL_MONITORING INSTALL_ELEMENT_CALL INSTALL_FAIL2BAN INSTALL_BACKUP_CRON INSTALL_MJOLNIR INSTALL_MAUBOT INSTALL_DISCORD INSTALL_METRICS_AUTH; do
+    for v in FEDERATION INSTALL_COTURN INSTALL_ELEMENT_CALL INSTALL_FAIL2BAN INSTALL_BACKUP_CRON INSTALL_MAUBOT INSTALL_DISCORD INSTALL_METRICS_AUTH; do
       eval "val=\$$v"; val="$(echo "${val:-}" | tr '[:upper:]' '[:lower:]')"
       case "$val" in ""|y|yes|1|true) eval "$v=y" ;; *) eval "$v=n" ;; esac
     done
-    [ "$INSTALL_MONITORING" != "y" ] && INSTALL_METRICS_AUTH="n"
+    # Legacy: INSTALL_MONITORING=y -> netdata, n -> none; INSTALL_MJOLNIR=y -> mjolnir
+    if [ -n "${INSTALL_MONITORING:-}" ]; then
+      case "$(echo "${INSTALL_MONITORING}" | tr '[:upper:]' '[:lower:]')" in y|yes|1|true) MONITORING_BACKEND=netdata ;; *) MONITORING_BACKEND=none ;; esac
+    fi
+    if [ -n "${INSTALL_MJOLNIR:-}" ]; then
+      case "$(echo "${INSTALL_MJOLNIR}" | tr '[:upper:]' '[:lower:]')" in y|yes|1|true) INSTALL_MODERATION_BOT=mjolnir ;; *) INSTALL_MODERATION_BOT=none ;; esac
+    fi
+    [ "$MONITORING_BACKEND" = "none" ] && INSTALL_METRICS_AUTH="n"
     ADMIN_USER="${ADMIN_USER:-admin}"
-    echo "  (NON_INTERACTIVE=1: using MATRIX_DOMAIN=$MATRIX_DOMAIN SERVER_NAME=$SERVER_NAME)"
+    echo "  (NON_INTERACTIVE=1: using MATRIX_DOMAIN=$MATRIX_DOMAIN SERVER_NAME=$SERVER_NAME MONITORING=$MONITORING_BACKEND MODERATION_BOT=$INSTALL_MODERATION_BOT)"
   else
     # Interactive prompts
     prompt MATRIX_DOMAIN "matrix.example.com" "Matrix client URL (hostname only, e.g. matrix.example.com):"
@@ -176,15 +183,29 @@ run_prompts() {
     prompt LE_EMAIL "admin@$SERVER_NAME" "Email for Let's Encrypt (cert expiry notices):"
     yesno FEDERATION "n" "Enable federation (open to other Matrix servers)?"
     yesno INSTALL_COTURN "y" "Install coturn (TURN/STUN for voice/video)?"
-    yesno INSTALL_MONITORING "y" "Install Prometheus + Grafana (metrics)?"
+    # Monitoring: exactly one of none, netdata, prometheus
+    read -p "Monitoring backend: (n)one / (net)data / (prom)etheus [netdata]: " mon_choice
+    mon_choice="${mon_choice:-netdata}"
+    case "$(echo "$mon_choice" | tr '[:upper:]' '[:lower:]')" in
+      n|no|none) MONITORING_BACKEND=none ;;
+      p|prom|prometheus) MONITORING_BACKEND=prometheus ;;
+      *) MONITORING_BACKEND=netdata ;;
+    esac
     yesno INSTALL_ELEMENT_CALL "n" "Install Element Call / LiveKit (Docker)?"
     yesno INSTALL_FAIL2BAN "y" "Install fail2ban (login brute-force protection)?"
     yesno INSTALL_BACKUP_CRON "y" "Install backup script and daily cron?"
-    yesno INSTALL_MJOLNIR "n" "Install Mjolnir (moderation bot, Docker)?"
+    # Moderation bot: exactly one of none, draupnir, mjolnir
+    read -p "Moderation bot: (n)one / (d)raupnir / (m)jolnir [none]: " mod_choice
+    mod_choice="${mod_choice:-none}"
+    case "$(echo "$mod_choice" | tr '[:upper:]' '[:lower:]')" in
+      d|draupnir) INSTALL_MODERATION_BOT=draupnir ;;
+      m|mj|mjolnir) INSTALL_MODERATION_BOT=mjolnir ;;
+      *) INSTALL_MODERATION_BOT=none ;;
+    esac
     yesno INSTALL_MAUBOT "n" "Install Maubot (plugin bot)?"
     yesno INSTALL_DISCORD "n" "Install Discord bridge (appservice)?"
-    if [ "$INSTALL_MONITORING" = "y" ]; then
-      yesno INSTALL_METRICS_AUTH "y" "Gate Prometheus/Grafana behind Synapse login (metrics-auth proxy)?"
+    if [ "$MONITORING_BACKEND" != "none" ]; then
+      yesno INSTALL_METRICS_AUTH "y" "Gate metrics behind Synapse login (metrics-auth proxy)?"
     fi
     read -p "First admin Matrix user (localpart, e.g. admin) [admin]: " ADMIN_USER
     ADMIN_USER="${ADMIN_USER:-admin}"
@@ -194,8 +215,8 @@ run_prompts() {
     echo "  Matrix URL: https://$MATRIX_DOMAIN"
     echo "  Server name (MXID): $SERVER_NAME"
     echo "  .well-known on: $ROOT_DOMAIN"
-    echo "  Federation: $FEDERATION | Coturn: $INSTALL_COTURN | Monitoring: $INSTALL_MONITORING | Element Call: $INSTALL_ELEMENT_CALL"
-    echo "  Fail2ban: $INSTALL_FAIL2BAN | Backup: $INSTALL_BACKUP_CRON | Mjolnir: $INSTALL_MJOLNIR | Maubot: $INSTALL_MAUBOT | Discord: $INSTALL_DISCORD | Metrics-auth: $INSTALL_METRICS_AUTH"
+    echo "  Federation: $FEDERATION | Coturn: $INSTALL_COTURN | Monitoring: $MONITORING_BACKEND | Element Call: $INSTALL_ELEMENT_CALL"
+    echo "  Fail2ban: $INSTALL_FAIL2BAN | Backup: $INSTALL_BACKUP_CRON | Moderation: $INSTALL_MODERATION_BOT | Maubot: $INSTALL_MAUBOT | Discord: $INSTALL_DISCORD | Metrics-auth: $INSTALL_METRICS_AUTH"
     read -p "Continue? (y/n) [y]: " cont
     cont="${cont:-y}"
     [[ "$cont" =~ ^[yY] ]] || exit 0
@@ -468,69 +489,128 @@ EOF
   echo "  Coturn enabled; TURN secret in /root/.matrix-turn-secret"
 }
 
-# ========== Phase 7: Optional monitoring (Prometheus + Grafana) ==========
+# ========== Phase 7: Optional monitoring (Netdata OR Prometheus, not both) ==========
 setup_monitoring() {
-  echo "[7/14] Optional: Prometheus + Grafana..."
-  if [ "$INSTALL_MONITORING" != "y" ]; then return 0; fi
-  apt-get install -y -qq prometheus prometheus-node-exporter 2>/dev/null || true
-  # Synapse metrics already in listener; ensure scrape config
-  mkdir -p /etc/prometheus
-  [ -f "$REPO_DIR/prometheus-full.yml" ] && sed "s/matrix.example.com/$MATRIX_DOMAIN/g;s/example.com/$SERVER_NAME/g" "$REPO_DIR/prometheus-full.yml" > /etc/prometheus/prometheus.yml || true
-  [ -f "$REPO_DIR/prometheus-alerts.yml" ] && cp "$REPO_DIR/prometheus-alerts.yml" /etc/prometheus/ || true
-  svc_enable prometheus
-  svc_enable prometheus-node-exporter
-  svc_start prometheus
-  svc_start prometheus-node-exporter
-  # Grafana
-  if ! command -v grafana-server &>/dev/null; then
-    wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor -o /usr/share/keyrings/grafana.gpg
-    echo "deb [signed-by=/usr/share/keyrings/grafana.gpg] https://apt.grafana.com stable main" > /etc/apt/sources.list.d/grafana.list
-    apt-get update -qq && apt-get install -y -qq grafana
+  echo "[7/14] Optional: Monitoring ($MONITORING_BACKEND)..."
+  if [ "$MONITORING_BACKEND" = "none" ]; then return 0; fi
+
+  if [ "$MONITORING_BACKEND" = "netdata" ]; then
+    if ! command -v netdata &>/dev/null; then
+      curl -sS https://get.netdata.cloud/kickstart.sh > /tmp/netdata-kickstart.sh
+      sh /tmp/netdata-kickstart.sh --dont-wait --disable-telemetry 2>/dev/null || true
+    fi
+    # Bind to localhost so nginx (with Synapse auth) is the only public entry
+    if [ -d /etc/netdata/netdata.conf.d ]; then
+      [ -f "$REPO_DIR/netdata/netdata-bind-localhost.conf" ] && cp "$REPO_DIR/netdata/netdata-bind-localhost.conf" /etc/netdata/netdata.conf.d/bind-localhost.conf
+    else
+      [ -f /etc/netdata/netdata.conf ] && grep -q "bind socket to IP" /etc/netdata/netdata.conf 2>/dev/null || \
+        printf '\n[web]\n    bind socket to IP = 127.0.0.1\n' >> /etc/netdata/netdata.conf
+    fi
+    svc_enable netdata
+    svc_start netdata
+    echo "  Netdata installed (web UI on :19999, bound to localhost when gated)."
+    return 0
   fi
-  mkdir -p /etc/grafana/provisioning/dashboards /etc/grafana/provisioning/datasources
-  [ -f "$REPO_DIR/grafana/provisioning/datasources/prometheus.yml" ] && cp "$REPO_DIR/grafana/provisioning/datasources/prometheus.yml" /etc/grafana/provisioning/datasources/ || true
-  [ -f "$REPO_DIR/grafana/dashboards/matrix-overview.json" ] && mkdir -p /etc/grafana/provisioning/dashboards/matrix && cp "$REPO_DIR/grafana/dashboards/matrix-overview.json" /etc/grafana/provisioning/dashboards/matrix/ || true
-  [ -f "$REPO_DIR/grafana/provisioning/dashboards/dashboards.yml" ] && sed 's|path:.*|path: /etc/grafana/provisioning/dashboards/matrix|' "$REPO_DIR/grafana/provisioning/dashboards/dashboards.yml" > /etc/grafana/provisioning/dashboards/dashboards.yml || true
-  # Only enable anonymous Grafana when metrics are gated behind metrics-auth (avoids accidental public dashboards)
-  if [ "$INSTALL_METRICS_AUTH" = "y" ] && [ -f "$REPO_DIR/grafana/conf.d/anonymous.ini" ]; then
-    mkdir -p /etc/grafana/conf.d && cp "$REPO_DIR/grafana/conf.d/anonymous.ini" /etc/grafana/conf.d/
+
+  if [ "$MONITORING_BACKEND" = "prometheus" ]; then
+    # Install Prometheus + node_exporter from upstream (Debian/Ubuntu often have old packages)
+    PROM_VERSION="${PROMETHEUS_VERSION:-2.47.0}"
+    NODE_VERSION="${NODE_EXPORTER_VERSION:-1.6.1}"
+    ARCH=$(dpkg --print-architecture)
+    [ "$ARCH" = "amd64" ] && ARCH="amd64" || true
+    [ "$ARCH" = "arm64" ] && ARCH="arm64" || true
+    [ "$ARCH" = "i386" ] && ARCH="386" || true
+    for name in prometheus node_exporter; do
+      [ "$name" = "prometheus" ] && ver="$PROM_VERSION" || ver="$NODE_VERSION"
+      [ "$name" = "prometheus" ] && dir="/opt/prometheus" || dir="/opt/node_exporter"
+      mkdir -p "$dir"
+      if [ ! -x "$dir/$name" ] 2>/dev/null; then
+        wget -q "https://github.com/prometheus/${name}/releases/download/v${ver}/${name}-${ver}.linux-${ARCH}.tar.gz" -O /tmp/${name}.tar.gz 2>/dev/null || true
+        if [ -f /tmp/${name}.tar.gz ]; then
+          tar -xzf /tmp/${name}.tar.gz -C /tmp
+          exdir="/tmp/${name}-${ver}.linux-${ARCH}"
+          [ -d "$exdir" ] || exdir="/tmp/$(tar -tzf /tmp/${name}.tar.gz | head -1 | cut -d/ -f1)"
+          [ -f "$exdir/$name" ] && cp "$exdir/$name" "$dir/" && chmod +x "$dir/$name"
+          rm -rf /tmp/${name}.tar.gz "$exdir"
+        fi
+      fi
+      [ "$name" = "node_exporter" ] && continue
+      # Prometheus config: scrape self + node_exporter
+      mkdir -p /opt/prometheus/data
+      cat > /opt/prometheus/prometheus.yml << 'PROMYML'
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['127.0.0.1:9090']
+  - job_name: node
+    static_configs:
+      - targets: ['127.0.0.1:9100']
+PROMYML
+      chown -R nobody:nogroup /opt/prometheus 2>/dev/null || true
+    done
+    # systemd units for prometheus and node_exporter
+    cat > /etc/systemd/system/node_exporter.service << 'NODEEOF'
+[Unit]
+Description=Prometheus Node Exporter
+After=network.target
+[Service]
+Type=simple
+ExecStart=/opt/node_exporter/node_exporter
+Restart=always
+[Install]
+WantedBy=multi-user.target
+NODEEOF
+    cat > /etc/systemd/system/prometheus.service << 'PROMEOF'
+[Unit]
+Description=Prometheus
+After=network.target
+[Service]
+Type=simple
+User=nobody
+ExecStart=/opt/prometheus/prometheus --config.file=/opt/prometheus/prometheus.yml --storage.tsdb.path=/opt/prometheus/data --web.listen-address=127.0.0.1:9090
+Restart=always
+[Install]
+WantedBy=multi-user.target
+PROMEOF
+    [ "$NO_SYSTEMD" = "0" ] && systemctl daemon-reload 2>/dev/null || true
+    svc_enable node_exporter
+    svc_start node_exporter
+    svc_enable prometheus
+    svc_start prometheus
+    echo "  Prometheus installed (UI on :9090, node_exporter on :9100, bound to localhost when gated)."
   fi
-  svc_enable grafana-server
-  svc_start grafana-server
-  echo "  Prometheus + Grafana installed (Prometheus on :9090, Grafana on :3000)."
 }
 
-# ========== Phase 8: Metrics-auth proxy (gate Prometheus/Grafana behind Synapse login) ==========
+# ========== Phase 8: Metrics-auth proxy (gate Netdata or Prometheus behind Synapse login) ==========
 setup_metrics_auth() {
   echo "[8/14] Metrics-auth proxy (gate metrics behind Synapse login)..."
-  if [ "$INSTALL_MONITORING" != "y" ] || [ "$INSTALL_METRICS_AUTH" != "y" ]; then return 0; fi
+  if [ "$MONITORING_BACKEND" = "none" ] || [ "$INSTALL_METRICS_AUTH" != "y" ]; then return 0; fi
   mkdir -p /opt/metrics-auth
   [ -f "$REPO_DIR/metrics-auth-proxy.py" ] && cp "$REPO_DIR/metrics-auth-proxy.py" /opt/metrics-auth/ && chmod 755 /opt/metrics-auth/metrics-auth-proxy.py
   [ -f "$REPO_DIR/metrics-auth-proxy.service" ] && sed "s|https://matrix.example.com|https://$MATRIX_DOMAIN|g" "$REPO_DIR/metrics-auth-proxy.service" > /etc/systemd/system/metrics-auth-proxy.service
   [ "$NO_SYSTEMD" = "0" ] && systemctl daemon-reload 2>/dev/null || true
   svc_enable metrics-auth-proxy
   svc_start metrics-auth-proxy
-  # Bind Prometheus to localhost and set external-url for subpath
-  if [ -f /etc/default/prometheus ]; then
-    grep -q "web.listen-address" /etc/default/prometheus 2>/dev/null || echo 'ARGS="--web.listen-address=127.0.0.1:9090 --web.external-url=https://'"$MATRIX_DOMAIN"'/metrics/ --web.route-prefix=/"' >> /etc/default/prometheus
-    svc_restart prometheus
+  # Ensure backend is bound to localhost
+  if [ "$MONITORING_BACKEND" = "netdata" ]; then
+    if [ -d /etc/netdata/netdata.conf.d ] && [ -f "$REPO_DIR/netdata/netdata-bind-localhost.conf" ]; then
+      cp "$REPO_DIR/netdata/netdata-bind-localhost.conf" /etc/netdata/netdata.conf.d/bind-localhost.conf
+      svc_restart netdata
+    fi
   fi
-  # Grafana: serve from subpath /metrics/grafana
-  mkdir -p /etc/grafana/conf.d
-  if [ ! -f /etc/grafana/conf.d/subpath.ini ]; then
-    cat > /etc/grafana/conf.d/subpath.ini << EOF
-[server]
-root_url = https://$MATRIX_DOMAIN/metrics/grafana
-serve_from_sub_path = true
-EOF
-    svc_restart grafana-server
-  fi
-  # Nginx: add metrics-auth and /metrics/ and /metrics/grafana/ to matrix 443 server block
+  # Nginx: add metrics-auth and /metrics/ (Netdata or Prometheus) to matrix 443 server block
   mkdir -p /etc/nginx/snippets
-  if [ -f "$REPO_DIR/nginx-metrics-auth.conf" ] && ! grep -q "metrics-auth/validate" /etc/nginx/sites-available/matrix 2>/dev/null; then
-    METRICS_SNIPPET="/etc/nginx/snippets/metrics-grafana.conf"
+  if ! grep -q "metrics-auth/validate" /etc/nginx/sites-available/matrix 2>/dev/null; then
+    METRICS_SNIPPET="/etc/nginx/snippets/metrics-netdata.conf"
+    if [ "$MONITORING_BACKEND" = "prometheus" ]; then
+      METRICS_UPSTREAM="127.0.0.1:9090"
+    else
+      METRICS_UPSTREAM="127.0.0.1:19999"
+    fi
     cat > "$METRICS_SNIPPET" << EOF
-# Gated metrics (auth_request via metrics-auth-proxy)
+# Gated metrics (auth_request via metrics-auth-proxy).
 location = /metrics-auth/validate {
     internal;
     proxy_pass http://127.0.0.1:9091/metrics-auth/validate;
@@ -549,28 +629,16 @@ location /metrics-auth/ {
 location /metrics/ {
     auth_request /metrics-auth/validate;
     auth_request_set \$auth_status \$upstream_status;
-    proxy_pass http://127.0.0.1:9090/;
+    proxy_pass http://$METRICS_UPSTREAM/;
     proxy_http_version 1.1;
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_redirect http://127.0.0.1:9090/ https://$MATRIX_DOMAIN/metrics/;
-}
-location /metrics/grafana/ {
-    auth_request /metrics-auth/validate;
-    auth_request_set \$auth_status \$upstream_status;
-    proxy_pass http://127.0.0.1:3000/;
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Prefix /metrics/grafana;
-    proxy_redirect http://127.0.0.1:3000/ https://$MATRIX_DOMAIN/metrics/grafana/;
+    proxy_redirect http://$METRICS_UPSTREAM/ https://$MATRIX_DOMAIN/metrics/;
 }
 EOF
-    # Insert include in the 443 server block (match actual vhost line: listen 443 ssl http2;)
-    sed -i '/listen 443 ssl http2;/a\    include /etc/nginx/snippets/metrics-grafana.conf;' /etc/nginx/sites-available/matrix
+    sed -i '/listen 443 ssl http2;/a\    include /etc/nginx/snippets/metrics-netdata.conf;' /etc/nginx/sites-available/matrix
     nginx -t && svc_reload nginx
   fi
   echo "  Metrics-auth proxy installed. Metrics at https://$MATRIX_DOMAIN/metrics/ (login with Matrix account)."
@@ -686,12 +754,14 @@ setup_fail2ban_nginx_hardening() {
   echo "[10/14] Fail2ban + nginx hardening..."
   if [ "$INSTALL_FAIL2BAN" = "y" ]; then
     [ -f "$REPO_DIR/fail2ban-matrix/filter.d/matrix-synapse-auth.conf" ] && cp "$REPO_DIR/fail2ban-matrix/filter.d/matrix-synapse-auth.conf" /etc/fail2ban/filter.d/
-    [ -f "$REPO_DIR/fail2ban-matrix/jail.d/matrix-synapse-auth.conf" ] && mkdir -p /etc/fail2ban/jail.d && cp "$REPO_DIR/fail2ban-matrix/jail.d/matrix-synapse-auth.conf" /etc/fail2ban/jail.d/
+    mkdir -p /etc/fail2ban/jail.d
+    [ -f "$REPO_DIR/fail2ban-matrix/jail.d/matrix-synapse-auth.conf" ] && cp "$REPO_DIR/fail2ban-matrix/jail.d/matrix-synapse-auth.conf" /etc/fail2ban/jail.d/
+    [ -f "$REPO_DIR/fail2ban-matrix/jail.d/sshd-lenient.conf" ] && cp "$REPO_DIR/fail2ban-matrix/jail.d/sshd-lenient.conf" /etc/fail2ban/jail.d/
     systemctl enable fail2ban && systemctl start fail2ban 2>/dev/null || true
     fail2ban-client reload 2>/dev/null || true
   fi
   # Rate-limit zones + hardening snippet (admin/metrics lockdown, rate-limited login).
-  # Hardening allows /_synapse/admin from 127.0.0.1, ::1, and 172.17.0.0/16 so Mjolnir in Docker can call admin API.
+  # Hardening allows /_synapse/admin from 127.0.0.1, ::1, and 172.17.0.0/16 so Draupnir/Mjolnir in Docker can call admin API.
   if [ -f "$REPO_DIR/nginx-synapse-rate-limit-zones.conf" ]; then
     mkdir -p /etc/nginx/conf.d /etc/nginx/snippets
     cp "$REPO_DIR/nginx-synapse-rate-limit-zones.conf" /etc/nginx/conf.d/
@@ -713,7 +783,7 @@ setup_backup() {
   # Copy whole repo so backup and future deploys have all configs
   if [ -d "$REPO_DIR" ] && [ -f "$REPO_DIR/backup-matrix.sh" ]; then
     cp -a "$REPO_DIR"/* /opt/matrix-backup/ 2>/dev/null || true
-    [ -d "$REPO_DIR/grafana" ] && cp -a "$REPO_DIR/grafana" /opt/matrix-backup/ 2>/dev/null || true
+    [ -d "$REPO_DIR/netdata" ] && cp -a "$REPO_DIR/netdata" /opt/matrix-backup/ 2>/dev/null || true
     [ -d "$REPO_DIR/fail2ban-matrix" ] && cp -a "$REPO_DIR/fail2ban-matrix" /opt/matrix-backup/ 2>/dev/null || true
     [ -d "$REPO_DIR/well-known" ] && cp -a "$REPO_DIR/well-known" /opt/matrix-backup/ 2>/dev/null || true
     chmod +x /opt/matrix-backup/backup-matrix.sh 2>/dev/null || true
@@ -724,10 +794,78 @@ setup_backup() {
   echo "  Backup script at /opt/matrix-backup/backup-matrix.sh; cron daily at 03:00."
 }
 
-# ========== Phase 12: Mjolnir (moderation bot, Docker) ==========
+# ========== Phase 12: Moderation bot (Draupnir or Mjolnir, Docker) ==========
+setup_draupnir() {
+  echo "[12/14] Draupnir (moderation bot)..."
+  if [ "$INSTALL_MODERATION_BOT" != "draupnir" ]; then return 0; fi
+  if ! command -v docker &>/dev/null; then
+    echo "  Docker not installed; skipping Draupnir. Install Docker and run setup-draupnir.sh from this repo."
+    return 0
+  fi
+  echo "  Draupnir needs an existing admin to create the bot user. Enter admin localpart (e.g. $ADMIN_USER) and password when prompted."
+  read -p "Admin localpart for Draupnir setup [$ADMIN_USER]: " DRAP_ADMIN
+  DRAP_ADMIN="${DRAP_ADMIN:-$ADMIN_USER}"
+  read -sp "Admin password: " ADMIN_PASSWORD
+  echo ""
+  if [ -z "$ADMIN_PASSWORD" ]; then
+    echo "  No password provided; skipping Draupnir. Run $REPO_DIR/setup-draupnir.sh manually (set MATRIX_PASSWORD, BASE=https://$MATRIX_DOMAIN, SERVER_NAME=$SERVER_NAME)."
+    return 0
+  fi
+  BASE="https://$MATRIX_DOMAIN"
+  ADMIN_TOKEN=$(curl -sS -X POST "$BASE/_matrix/client/r0/login" -H "Content-Type: application/json" \
+    -d "{\"type\":\"m.login.password\",\"user\":\"$DRAP_ADMIN\",\"password\":\"$ADMIN_PASSWORD\"}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+  if [ -z "$ADMIN_TOKEN" ]; then
+    echo "  Failed to get admin token; skipping Draupnir. Run setup-draupnir.sh manually."
+    return 0
+  fi
+  DRAUPNIR_PASSWORD="${DRAUPNIR_PASSWORD:-$(openssl rand -base64 24)}"
+  curl -sS -X PUT "$BASE/_synapse/admin/v2/users/@draupnir:$SERVER_NAME" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+    -d "{\"password\":\"$DRAUPNIR_PASSWORD\",\"admin\":true,\"logout_devices\":false}" | grep -q "name" || true
+  DRAUPNIR_TOKEN=$(curl -sS -X POST "$BASE/_matrix/client/r0/login" -H "Content-Type: application/json" \
+    -d "{\"type\":\"m.login.password\",\"user\":\"draupnir\",\"password\":\"$DRAUPNIR_PASSWORD\"}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+  if [ -z "$DRAUPNIR_TOKEN" ]; then
+    echo "  Failed to get Draupnir token (rate limit?); run setup-draupnir.sh later with DRAUPNIR_PASSWORD=$DRAUPNIR_PASSWORD"
+    return 0
+  fi
+  ROOM_ID=$(curl -sS -X POST "$BASE/_matrix/client/r0/createRoom" -H "Authorization: Bearer $DRAUPNIR_TOKEN" \
+    -H "Content-Type: application/json" -d '{"name":"Draupnir management","preset":"private_chat"}' | python3 -c "import sys,json; print(json.load(sys.stdin).get('room_id',''))" 2>/dev/null)
+  if [ -z "$ROOM_ID" ]; then
+    echo "  Failed to create management room; run setup-draupnir.sh manually."
+    return 0
+  fi
+  curl -sS -X POST "$BASE/_matrix/client/r0/rooms/${ROOM_ID}/invite" -H "Authorization: Bearer $DRAUPNIR_TOKEN" \
+    -H "Content-Type: application/json" -d "{\"user_id\":\"@$DRAP_ADMIN:$SERVER_NAME\"}" >/dev/null 2>&1 || true
+  mkdir -p /opt/draupnir/config /opt/draupnir/data
+  if [ -f "$REPO_DIR/draupnir-production.yaml" ]; then
+    sed "s|https://matrix.example.com|$BASE|g;s|example.com|$SERVER_NAME|g;s|REPLACE_AFTER_SETUP|$DRAUPNIR_TOKEN|g;s|!REPLACE:example.com|$ROOM_ID|g" "$REPO_DIR/draupnir-production.yaml" > /opt/draupnir/config/production.yaml
+  else
+    cat > /opt/draupnir/config/production.yaml << EOF
+homeserverUrl: $BASE
+rawHomeserverUrl: $BASE
+accessToken: $DRAUPNIR_TOKEN
+managementRoom: "$ROOM_ID"
+dataPath: /data/storage
+autojoinOnlyIfManager: true
+logLevel: INFO
+verifyPermissionsOnStartup: true
+noop: false
+EOF
+  fi
+  if ! docker image inspect gnuxie/draupnir:latest &>/dev/null 2>&1; then
+    docker pull gnuxie/draupnir:latest
+  fi
+  (docker stop draupnir 2>/dev/null; docker rm draupnir 2>/dev/null) || true
+  docker run -d --name draupnir --restart unless-stopped \
+    -v /opt/draupnir/config/production.yaml:/data/config/production.yaml:ro \
+    -v /opt/draupnir/data:/data/storage \
+    gnuxie/draupnir:latest bot --draupnir-config /data/config/production.yaml
+  echo "  Draupnir running (Docker container draupnir). Management room: $ROOM_ID (invited @$DRAP_ADMIN:$SERVER_NAME)."
+}
+
 setup_mjolnir() {
   echo "[12/14] Mjolnir (moderation bot)..."
-  if [ "$INSTALL_MJOLNIR" != "y" ]; then return 0; fi
+  if [ "$INSTALL_MODERATION_BOT" != "mjolnir" ]; then return 0; fi
   if ! command -v docker &>/dev/null; then
     echo "  Docker not installed; skipping Mjolnir. Install Docker and run setup-mjolnir.sh from this repo."
     return 0
@@ -923,6 +1061,7 @@ main() {
   setup_element_call
   setup_fail2ban_nginx_hardening
   setup_backup
+  setup_draupnir
   setup_mjolnir
   setup_maubot
   setup_discord
@@ -937,9 +1076,10 @@ main() {
   echo "  TURN secret: /root/.matrix-turn-secret (if coturn installed)"
   echo "  Registration shared secret: in conf.d/registration.yaml (remove after creating first user if desired)"
   echo "  Backup: /opt/matrix-backup/backup-matrix.sh (cron 03:00)"
-  [ "$INSTALL_MONITORING" = "y" ] && [ "$INSTALL_METRICS_AUTH" = "y" ] && echo "  Gated metrics: https://$MATRIX_DOMAIN/metrics/ (login with Matrix)"
+  [ "$MONITORING_BACKEND" != "none" ] && [ "$INSTALL_METRICS_AUTH" = "y" ] && echo "  Gated metrics: https://$MATRIX_DOMAIN/metrics/ (login with Matrix)"
   [ "$INSTALL_ELEMENT_CALL" = "y" ] && echo "  Element Call backend: /opt/element-call (LiveKit + lk-jwt-service)"
-  [ "$INSTALL_MJOLNIR" = "y" ] && echo "  Mjolnir: Docker container mjolnir"
+  [ "$INSTALL_MODERATION_BOT" = "draupnir" ] && echo "  Draupnir: Docker container draupnir"
+  [ "$INSTALL_MODERATION_BOT" = "mjolnir" ] && echo "  Mjolnir: Docker container mjolnir"
   echo ""
   echo "Next: Install Element Web (or use element.io) and set homeserver to https://$MATRIX_DOMAIN. See README for post-setup steps."
 }
