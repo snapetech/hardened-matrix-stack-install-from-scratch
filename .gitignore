@@ -1,0 +1,8 @@
+# Load-test: generated and secret files (tokens, passwords, server-specific config)
+load-test/.env
+load-test/config.yaml
+load-test/test_users.json
+load-test/.safety_triggered
+load-test/*.txt
+load-test/scripts/__pycache__/
+load-test/.venv/
