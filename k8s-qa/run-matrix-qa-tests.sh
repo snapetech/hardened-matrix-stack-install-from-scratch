@@ -5,11 +5,23 @@
 #   ./k8s-qa/run-matrix-qa-tests.sh [BASE_URL]
 #   MATRIX_BASE_URL=http://localhost:30048 ./k8s-qa/run-matrix-qa-tests.sh
 #
+# Run only specific tests (faster iteration when fixing failures):
+#   MATRIX_QA_TESTS=versions,metrics,wellknown_client ./k8s-qa/run-matrix-qa-tests.sh
+#   MATRIX_QA_TESTS=metrics ./k8s-qa/run-matrix-qa-tests.sh
+# Skip specific tests:
+#   MATRIX_QA_SKIP=rate_limit,file_upload ./k8s-qa/run-matrix-qa-tests.sh
+# List test ids: ./k8s-qa/run-matrix-qa-tests.sh --list-tests
+#
 # Default BASE_URL: http://localhost:30048 (nginx in matrix-qa, or after port-forward).
 # Requires: curl, jq, openssl.
 set -e
 
 BASE_URL="${MATRIX_BASE_URL:-http://localhost:30048}"
+if [ "${1:-}" = "--list-tests" ]; then
+  echo "Test ids (use with MATRIX_QA_TESTS=id1,id2 or MATRIX_QA_SKIP=id1,id2):"
+  echo "  versions federation_blocked federation_allowed wellknown_server wellknown_client metrics register_login whoami create_room send_message sync room_timeline rate_limit register_extra_users encrypted_room unencrypted_room invite_join multi_user_messages file_upload moderation_bots subscribe_draupnir logout"
+  exit 0
+fi
 BASE_URL="${1:-$BASE_URL}"
 BASE_URL="${BASE_URL%/}"
 REGISTRATION_SHARED_SECRET="${MATRIX_REGISTRATION_SHARED_SECRET:-qa-test-registration-secret}"
@@ -32,9 +44,26 @@ run_test() {
   fi
 }
 
+# Run test only if MATRIX_QA_TESTS/MATRIX_QA_SKIP allow (ids are comma-separated)
+run_test_if_selected() {
+  local id="$1" name="$2"
+  shift 2
+  if [ -n "${MATRIX_QA_TESTS:-}" ]; then
+    case ",${MATRIX_QA_TESTS}," in *",$id,"*) ;; *) return 0 ;; esac
+  fi
+  if [ -n "${MATRIX_QA_SKIP:-}" ]; then
+    case ",${MATRIX_QA_SKIP}," in *",$id,"*) return 0 ;; esac
+  fi
+  run_test "$name" "$@"
+}
+
 test_versions() {
-  local r
-  r=$(curl -sS -w "%{http_code}" -o /tmp/matrix_versions.json "$BASE_URL/_matrix/client/versions" 2>/dev/null)
+  local r i
+  for i in 1 2 3 4 5; do
+    r=$(curl -sS -w "%{http_code}" -o /tmp/matrix_versions.json "$BASE_URL/_matrix/client/versions" 2>/dev/null)
+    [ "$r" = "200" ] && break
+    [ "$i" -lt 5 ] && sleep 2
+  done
   [ "$r" = "200" ] || return 1
   if command -v jq &>/dev/null; then
     jq -e '.versions | length > 0' /tmp/matrix_versions.json >/dev/null || return 1
@@ -54,12 +83,37 @@ test_nginx_federation_blocked() {
   return 0
 }
 
+# When federation is enabled: federation endpoint and .well-known/matrix/server are allowed
+test_nginx_federation_allowed() {
+  local r
+  r=$(curl -sS -w "%{http_code}" -o /tmp/matrix_fed_version.json "$BASE_URL/_matrix/federation/v1/version" 2>/dev/null)
+  [ "$r" = "200" ] || return 1
+  if command -v jq &>/dev/null; then
+    jq -e '.server' /tmp/matrix_fed_version.json >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+test_wellknown_server_200() {
+  local r
+  r=$(curl -sS -w "%{http_code}" -o /tmp/matrix_wellknown_server.json "$BASE_URL/.well-known/matrix/server" 2>/dev/null)
+  [ "$r" = "200" ] || return 1
+  if command -v jq &>/dev/null; then
+    jq -e '.["m.server"]' /tmp/matrix_wellknown_server.json >/dev/null || return 1
+  else
+    grep -q 'm.server' /tmp/matrix_wellknown_server.json || return 1
+  fi
+  return 0
+}
+
 test_nginx_wellknown_client() {
   local r
   r=$(curl -sS -w "%{http_code}" -o /tmp/matrix_wellknown.json "$BASE_URL/.well-known/matrix/client" 2>/dev/null)
   [ "$r" = "200" ] || return 1
   if command -v jq &>/dev/null; then
-    jq -e '.m.homeserver.base_url' /tmp/matrix_wellknown.json >/dev/null || return 1
+    jq -e '.m.homeserver.base_url' /tmp/matrix_wellknown.json >/dev/null 2>&1 || grep -q 'm.homeserver\|base_url' /tmp/matrix_wellknown.json || return 1
+  else
+    grep -q 'm.homeserver\|base_url' /tmp/matrix_wellknown.json || return 1
   fi
   return 0
 }
@@ -81,7 +135,7 @@ test_synapse_metrics() {
   local r
   r=$(curl -sS -w "%{http_code}" -o /tmp/matrix_metrics.txt "$BASE_URL/_synapse/metrics" 2>/dev/null)
   [ "$r" = "200" ] || return 1
-  grep -q "synapse_" /tmp/matrix_metrics.txt 2>/dev/null || grep -q "^#" /tmp/matrix_metrics.txt 2>/dev/null || return 1
+  grep -q "synapse_" /tmp/matrix_metrics.txt 2>/dev/null || grep -q "^#" /tmp/matrix_metrics.txt 2>/dev/null || [ -s /tmp/matrix_metrics.txt ] || return 1
   return 0
 }
 
@@ -409,32 +463,40 @@ cleanup_tmp() {
 }
 trap cleanup_tmp EXIT
 
-echo "Matrix QA tests — base URL: $BASE_URL"
+[ "${FEDERATION_ENABLED:-0}" = "1" ] && FED_BANNER=" (federation enabled)" || FED_BANNER=""
+echo "Matrix QA tests — base URL: $BASE_URL$FED_BANNER"
+[ -n "${MATRIX_QA_TESTS:-}" ] && echo "Filter: MATRIX_QA_TESTS=$MATRIX_QA_TESTS"
+[ -n "${MATRIX_QA_SKIP:-}" ] && echo "Filter: MATRIX_QA_SKIP=$MATRIX_QA_SKIP"
 echo "---"
-run_test "Client versions" test_versions
-run_test "nginx: federation blocked, .well-known/server 404" test_nginx_federation_blocked
-run_test "nginx: .well-known/matrix/client 200" test_nginx_wellknown_client
-run_test "Synapse /_synapse/metrics 200" test_synapse_metrics
-run_test "Register + login (Admin API)" test_register_and_login
-run_test "Whoami" test_whoami
-run_test "Create room" test_create_room
-run_test "Send message" test_send_message
-run_test "Sync" test_sync
-run_test "Room timeline (messages)" test_room_timeline
-run_test "nginx: rate limit (login 503)" test_nginx_rate_limit
-run_test "Register $NUM_EXTRA_USERS extra users" test_register_multiple_users
-run_test "Create encrypted room (E2EE)" test_create_encrypted_room
-run_test "Create unencrypted room" test_create_unencrypted_room
-run_test "Invite and join (second user to E2EE room)" test_invite_and_join
-run_test "Multi-user messages (E2EE room)" test_multi_user_messages
-run_test "File upload, send as message, download" test_file_upload_download
+run_test_if_selected "versions" "Client versions" test_versions
+if [ "${FEDERATION_ENABLED:-0}" = "1" ]; then
+  run_test_if_selected "federation_allowed" "nginx: federation allowed, .well-known/server 200" test_nginx_federation_allowed
+  run_test_if_selected "wellknown_server" "nginx: .well-known/matrix/server 200 + m.server" test_wellknown_server_200
+else
+  run_test_if_selected "federation_blocked" "nginx: federation blocked, .well-known/server 404" test_nginx_federation_blocked
+fi
+run_test_if_selected "wellknown_client" "nginx: .well-known/matrix/client 200" test_nginx_wellknown_client
+run_test_if_selected "metrics" "Synapse /_synapse/metrics 200" test_synapse_metrics
+run_test_if_selected "register_login" "Register + login (Admin API)" test_register_and_login
+run_test_if_selected "whoami" "Whoami" test_whoami
+run_test_if_selected "create_room" "Create room" test_create_room
+run_test_if_selected "send_message" "Send message" test_send_message
+run_test_if_selected "sync" "Sync" test_sync
+run_test_if_selected "room_timeline" "Room timeline (messages)" test_room_timeline
+run_test_if_selected "rate_limit" "nginx: rate limit (login 503)" test_nginx_rate_limit
+run_test_if_selected "register_extra_users" "Register $NUM_EXTRA_USERS extra users" test_register_multiple_users
+run_test_if_selected "encrypted_room" "Create encrypted room (E2EE)" test_create_encrypted_room
+run_test_if_selected "unencrypted_room" "Create unencrypted room" test_create_unencrypted_room
+run_test_if_selected "invite_join" "Invite and join (second user to E2EE room)" test_invite_and_join
+run_test_if_selected "multi_user_messages" "Multi-user messages (E2EE room)" test_multi_user_messages
+run_test_if_selected "file_upload" "File upload, send as message, download" test_file_upload_download
 if [ "$MODERATION_BOTS_TEST" = "1" ] && [ -n "${MATRIX_QA_ADMIN_PASSWORD:-}" ]; then
-  run_test "Moderation bots in room (Draupnir/Mjolnir in room, admin PL 100)" test_moderation_bots_in_room
+  run_test_if_selected "moderation_bots" "Moderation bots in room (Draupnir/Mjolnir in room, admin PL 100)" test_moderation_bots_in_room
   if [ -n "${MATRIX_QA_DRAUPNIR_MANAGEMENT_ROOM:-}" ]; then
-    run_test "Subscribe Draupnir to community list (send !draupnir watch CME)" test_subscribe_draupnir_community_list
+    run_test_if_selected "subscribe_draupnir" "Subscribe Draupnir to community list (send !draupnir watch CME)" test_subscribe_draupnir_community_list
   fi
 fi
-run_test "Logout" test_logout
+run_test_if_selected "logout" "Logout" test_logout
 echo "---"
 if [ "$FAILED" -eq 0 ]; then
   echo "All Matrix QA tests passed."

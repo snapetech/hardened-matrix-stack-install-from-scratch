@@ -56,6 +56,13 @@ Or with metrics collection (writes `metrics.jsonl`):
 
 First run will **create** test users and a private E2EE room (invite-only; only `admin_user_id` and the test bots). When the run finishes, **test users are deactivated** (removed) if they were created in that run. Reuse with existing users/room by ensuring `test_users.json` and `test_room_id.txt` (or `test_room_id` in config) exist, or pass `--no-create-users` and set `TEST_ROOM_ID` / `test_room_id` (in that case users are not deactivated at the end).
 
+## Small nodes (1 vCPU / 1 GiB)
+
+On constrained clusters or VPS, use fewer participants and shorter duration to avoid OOM or safety triggers:
+
+- `--participants 2` or `3`, `--duration 60` or `120`
+- The scripts use 320×240 @ 15 fps video and synthetic audio; for even lighter load, you can reduce resolution/fps in `participant.py` or run LiveKit’s own `lk load-test` with `--video-resolution low --no-simulcast` (see k8s-qa/SMALL-CLUSTER.md).
+
 ## Safety
 
 - If `safety.load1_max` is set and Prometheus (or SSH /proc/loadavg when prometheus_url empty) returns load1 above it, the orchestrator writes a stop signal and all participants disconnect; exit code 2.

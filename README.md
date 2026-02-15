@@ -17,6 +17,9 @@ cd /path/to/hardened-matrix-stack-install-from-scratch
 sudo ./setup-from-scratch.sh
 ```
 
+**Tiny VPS (1GB/1 vCPU):** Run with `TINY_VPS=1` to default monitoring to none, use smaller DB pool (`cp_min=1`, `cp_max=5`), and apply Synapse tuning (presence off, search off, smaller cache, etc.):  
+`TINY_VPS=1 ./setup-from-scratch.sh`. You can override pool size: `TINY_VPS=1 DB_CP_MIN=1 DB_CP_MAX=3 ./setup-from-scratch.sh`.
+
 The script prompts for:
 
 | Prompt | Example | Meaning |

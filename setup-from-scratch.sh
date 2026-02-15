@@ -19,6 +19,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-$SCRIPT_DIR}"
 
 # --- Defaults (overridden by prompts or env when NON_INTERACTIVE=1) ---
+TINY_VPS="${TINY_VPS:-0}"
+DEFAULT_MONITORING="netdata"
+DEFAULT_DB_CP_MIN="5"
+DEFAULT_DB_CP_MAX="10"
+if [ "$TINY_VPS" = "1" ]; then
+  DEFAULT_MONITORING="none"
+  DEFAULT_DB_CP_MIN="1"
+  DEFAULT_DB_CP_MAX="5"
+fi
+
 MATRIX_DOMAIN="${MATRIX_DOMAIN:-}"
 SERVER_NAME="${SERVER_NAME:-}"
 ROOT_DOMAIN="${ROOT_DOMAIN:-}"
@@ -26,7 +36,9 @@ LE_EMAIL="${LE_EMAIL:-}"
 FEDERATION="${FEDERATION:-n}"
 INSTALL_COTURN="${INSTALL_COTURN:-y}"
 # Monitoring: exactly one of none, netdata, prometheus
-MONITORING_BACKEND="${MONITORING_BACKEND:-netdata}"
+MONITORING_BACKEND="${MONITORING_BACKEND:-$DEFAULT_MONITORING}"
+DB_CP_MIN="${DB_CP_MIN:-$DEFAULT_DB_CP_MIN}"
+DB_CP_MAX="${DB_CP_MAX:-$DEFAULT_DB_CP_MAX}"
 INSTALL_ELEMENT_CALL="${INSTALL_ELEMENT_CALL:-n}"
 INSTALL_FAIL2BAN="${INSTALL_FAIL2BAN:-y}"
 INSTALL_BACKUP_CRON="${INSTALL_BACKUP_CRON:-y}"
@@ -252,7 +264,7 @@ install_base() {
   apt-get update -qq
   apt-get install -y -qq apt-utils curl wget ca-certificates gnupg lsb-release \
     postgresql postgresql-client nginx certbot python3-certbot-nginx \
-    python3 python3-pip python3-venv
+    python3 python3-pip python3-venv python3-yaml
   if [ "$INSTALL_COTURN" = "y" ]; then
     apt-get install -y -qq coturn
   fi
@@ -296,8 +308,8 @@ database:
     database: synapse
     host: localhost
     port: 5432
-    cp_min: 5
-    cp_max: 10
+    cp_min: $DB_CP_MIN
+    cp_max: $DB_CP_MAX
 EOF
   chmod 600 /etc/matrix-synapse/conf.d/database.yaml
   chown matrix-synapse:matrix-synapse /etc/matrix-synapse/conf.d/database.yaml
@@ -318,6 +330,22 @@ enable_registration: false
 enable_registration_without_verification: false
 registration_shared_secret: "$REGISTRATION_SHARED_SECRET"
 EOF
+  # Tiny VPS tuning: reduce memory and background work (presence, search, cache, etc.)
+  if [ "${TINY_VPS:-0}" = "1" ]; then
+    cat > /etc/matrix-synapse/conf.d/20-tiny-vps.yaml << EOF
+presence:
+  enabled: false
+enable_search: false
+url_preview_enabled: false
+caches:
+  global_factor: 0.25
+user_ips_max_age: 7d
+max_image_pixels: 16M
+EOF
+  else
+    rm -f /etc/matrix-synapse/conf.d/20-tiny-vps.yaml
+  fi
+
   chmod 600 /etc/matrix-synapse/conf.d/registration.yaml
   chown matrix-synapse:matrix-synapse /etc/matrix-synapse/conf.d/registration.yaml
   # Listener: client-only (no federation) or client+federation
@@ -352,14 +380,25 @@ EOF
   fi
   # Remove default listener from main config if it exists (we use conf.d)
   if [ -f /etc/matrix-synapse/homeserver.yaml ]; then
-    python3 -c "
+    if ! python3 -c "import yaml" 2>/dev/null; then
+      echo "Installing python3-yaml for Synapse config cleanup..."
+      apt-get install -y -qq python3-yaml || { echo "ERROR: python3-yaml required to remove listeners from homeserver.yaml. Install it and re-run." >&2; exit 1; }
+    fi
+    python3 - <<'PY' || { echo "ERROR: Failed to remove listeners from homeserver.yaml (check PyYAML and file permissions)." >&2; exit 1; }
 import yaml
+import sys
 p = '/etc/matrix-synapse/homeserver.yaml'
-with open(p) as f: c = yaml.safe_load(f)
-if c and 'listeners' in c:
-  del c['listeners']
-  with open(p, 'w') as f: yaml.dump(c, f, default_flow_style=False)
-" 2>/dev/null || true
+try:
+    with open(p) as f:
+        c = yaml.safe_load(f) or {}
+    if 'listeners' in c:
+        del c['listeners']
+        with open(p, 'w') as f:
+            yaml.safe_dump(c, f, default_flow_style=False, sort_keys=False)
+except Exception as e:
+    print(f"Synapse config cleanup failed: {e}", file=sys.stderr)
+    sys.exit(1)
+PY
   fi
   chown -R matrix-synapse:matrix-synapse /etc/matrix-synapse/conf.d
   # Signing key is created by Synapse on first start if missing
@@ -713,6 +752,8 @@ location /metrics/ {
     proxy_redirect http://$METRICS_UPSTREAM/ https://$MATRIX_DOMAIN/metrics/;
 }
 EOF
+    # Rerun-safe: remove any existing include before adding (avoids duplicate on second run)
+    sed -i '/include \/etc\/nginx\/snippets\/metrics-netdata\.conf/d' /etc/nginx/sites-available/matrix
     sed -i '/listen 443 ssl http2;/a\    include /etc/nginx/snippets/metrics-netdata.conf;' /etc/nginx/sites-available/matrix
     nginx -t && svc_reload nginx
   fi
@@ -751,7 +792,8 @@ with open(p, 'w') as f: json.dump(d, f, indent=2)
     svc_start docker
   fi
   if ! command -v docker compose &>/dev/null && ! docker-compose --version &>/dev/null 2>&1; then
-    apt-get install -y -qq docker-compose-plugin 2>/dev/null || true
+    echo "Installing Docker Compose plugin for Element Call..."
+    apt-get install -y -qq docker-compose-plugin || { echo "ERROR: docker-compose-plugin required for Element Call. Install it and re-run." >&2; exit 1; }
   fi
   mkdir -p /opt/element-call
   LIVEKIT_KEY="${LIVEKIT_KEY:-$(openssl rand -hex 16)}"
@@ -783,7 +825,7 @@ EOF
   # Fix auth-service LIVEKIT_URL in compose (env sub is from .env; ensure host is correct)
   sed -i "s|wss://MATRIX_RTC_HOST/livekit/sfu|wss://$MATRIX_RTC_HOST/livekit/sfu|g" /opt/element-call/docker-compose.yml 2>/dev/null || true
   # Start containers
-  (cd /opt/element-call && docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null || true)
+  (cd /opt/element-call && (docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null)) || { echo "ERROR: Element Call (LiveKit) failed to start. Check docker compose and logs." >&2; exit 1; }
   # Synapse: experimental Element Call + MSCs (MSC3266, MSC4222, MSC4140)
   cat > /etc/matrix-synapse/conf.d/experimental-element-call.yaml << EOF
 # Element Call / MatrixRTC (LiveKit)

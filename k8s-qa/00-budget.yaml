@@ -1,0 +1,32 @@
+# Optional: apply when running k8s-qa on a 1 vCPU / 1 GiB node (e.g. minikube --cpus=1 --memory=1024mb).
+# Ensures the stack cannot exceed the budget; prevents "forgot to set resources" from OOMing the node.
+# Apply first: kubectl apply -f k8s-qa/00-budget.yaml
+# Then deploy the rest. Verify: kubectl describe quota -n matrix-qa
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: matrix-qa-quota
+  namespace: matrix-qa
+spec:
+  hard:
+    pods: "30"
+    requests.cpu: "600m"
+    requests.memory: "650Mi"
+    limits.cpu: "1000m"
+    limits.memory: "950Mi"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: matrix-qa-defaults
+  namespace: matrix-qa
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: "25m"
+        memory: "32Mi"
+      default:
+        cpu: "100m"
+        memory: "96Mi"

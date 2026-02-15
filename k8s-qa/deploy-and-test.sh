@@ -11,11 +11,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 export KUBECONFIG
+# Phase 1 / standalone: no federation; run-matrix-qa-tests uses FEDERATION_ENABLED to pick tests
+export FEDERATION_ENABLED=0
 
 echo "Deploying k8s-qa (namespace, postgres, synapse, nginx, coturn, livekit)..."
 for f in namespace.yaml postgres.yaml synapse-deployment.yaml nginx-configmap.yaml nginx.yaml coturn.yaml livekit.yaml; do
   [ -f "$SCRIPT_DIR/$f" ] && kubectl apply -f "$SCRIPT_DIR/$f"
 done
+kubectl rollout restart deployment nginx -n matrix-qa 2>/dev/null || true
+kubectl rollout restart deployment synapse -n matrix-qa 2>/dev/null || true
 # Optional: moderation bots (Draupnir + Mjolnir). Requires Secret matrix-qa-admin with key admin-password.
 if kubectl get secret matrix-qa-admin -n matrix-qa &>/dev/null; then
   kubectl apply -f "$SCRIPT_DIR/ensure-moderation-bots-configmap.yaml" 2>/dev/null || true
@@ -73,10 +77,13 @@ if [ -z "$BASE_URL" ]; then
   kubectl port-forward -n matrix-qa svc/lk-jwt 30050:6080 &
   PF3=$!
   trap "kill $PF1 $PF2 $PF3 2>/dev/null" EXIT
-  sleep 3
+  sleep 5
   BASE_URL="http://localhost:30048"
   LIVEKIT_WS_URL="ws://localhost:30049"
   LIVEKIT_JWT_URL="http://localhost:30050"
+  export MATRIX_BASE_URL="$BASE_URL"
+  export LIVEKIT_WS_URL
+  export LIVEKIT_JWT_URL
 fi
 
 echo "Running E2E QA..."
@@ -89,7 +96,7 @@ if kubectl get secret matrix-qa-admin -n matrix-qa &>/dev/null && kubectl get se
   export MATRIX_QA_DRAUPNIR_MANAGEMENT_ROOM
   export MODERATION_BOTS_TEST=1
 fi
-MATRIX_BASE_URL="$BASE_URL" LIVEKIT_WS_URL="$LIVEKIT_WS_URL" LIVEKIT_JWT_URL="$LIVEKIT_JWT_URL" "$SCRIPT_DIR/run-e2e-qa.sh"
+MATRIX_BASE_URL="$BASE_URL" LIVEKIT_WS_URL="${LIVEKIT_WS_URL:-}" LIVEKIT_JWT_URL="${LIVEKIT_JWT_URL:-}" FEDERATION_ENABLED=0 "$SCRIPT_DIR/run-e2e-qa.sh"
 
 # Optional: if msmtp credentials secret exists, send one test email (same path fail2ban/msmtp use on VM)
 if kubectl get secret msmtp-credentials -n matrix-qa &>/dev/null; then

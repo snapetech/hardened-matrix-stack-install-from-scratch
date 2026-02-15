@@ -22,15 +22,19 @@ Minimal or full Matrix stack in Kubernetes for QA: Synapse (SQLite or Postgres),
 | File | Purpose |
 |------|---------|
 | **namespace.yaml** | `matrix-qa` namespace |
+| **00-budget.yaml** | Optional: ResourceQuota + LimitRange for 1 vCPU / 1 GiB node; apply with namespace before other manifests. See **SMALL-CLUSTER.md**. |
 | **synapse-deployment.yaml** | Synapse pod (init: generate + config + optional Postgres), Service ClusterIP (backend only). |
 | **nginx-configmap.yaml** + **nginx.yaml** | nginx reverse proxy: proxy to Synapse, rate-limit login/register, no-federation. Single entrypoint NodePort 30048. |
 | **postgres.yaml** | Optional PostgreSQL for Synapse (Deployment + Service + Secret). Synapse uses it when this is applied. |
 | **coturn.yaml** | Optional Coturn (TURN/STUN); Synapse gets turn.yaml when this is applied. coturn-test-job verifies port 3478. |
 | **livekit.yaml** | Optional LiveKit server + lk-jwt-service for Element Call / MatrixRTC. NodePorts 30049 (WS), 30050 (JWT). |
-| **run-matrix-qa-tests.sh** | API tests: versions, nginx (federation block, .well-known, rate limit), metrics, whoami, sync, timeline, register/login, rooms, file upload/download, logout |
+| **run-matrix-qa-tests.sh** | API tests: versions, nginx (federation block, .well-known, rate limit), metrics, whoami, sync, timeline, register/login, rooms, file upload/download, logout. Supports `MATRIX_QA_TESTS=id1,id2` and `MATRIX_QA_SKIP=id1,id2`; `--list-tests` prints ids. |
+| **deploy-only.sh** | Deploy stack + port-forward only (no tests). Run once, then run test subsets (e.g. `run-quick-tests.sh` or `MATRIX_QA_TESTS=metrics run-matrix-qa-tests.sh`) without re-deploying. |
+| **run-quick-tests.sh** | Run only quick/smoke tests: versions, federation (blocked or allowed), wellknown client, metrics. |
 | **run-e2e-qa.sh** | Full E2E: runs API tests, then (if LiveKit URLs set) headless call tests (3–5 participants, video+audio) |
 | **port-forward-and-test.sh** | Port-forward nginx to localhost:30048, run API tests, then stop forward |
 | **deploy-and-test.sh** | Deploy all manifests, wait for Ready, then run E2E (with port-forward if no BASE_URL). If Secret `msmtp-credentials` exists, runs optional email test. |
+| **run-full-qa-two-phase.sh** | **Full front-to-back:** Phase 1 = deploy with **no federation**, run all tests (API, Coturn, LiveKit/calls, moderation bots, optional email). Phase 2 = enable federation (apply nginx-configmap-federation), run federation + blocklist tests (`.well-known/matrix/server`, federation allowed, subscribe Draupnir to CME). Creates `matrix-qa-admin` Secret if missing so moderation bots run. |
 | **send-test-email.sh** | Optional: send one test email from the cluster (verifies msmtp/alert path; same path fail2ban uses on VM). Requires Secret; see below. |
 | **send-test-email-job.yaml** + **send-test-email-configmap.yaml** | Job + script to send one email via Gmail SMTP. No secrets in repo. |
 | **moderation-bots-setup-job.yaml** | One-time Job: create admin (if missing), @draupnir/@mjolnir, management rooms; outputs tokens for Secrets. |
@@ -40,6 +44,7 @@ Minimal or full Matrix stack in Kubernetes for QA: Synapse (SQLite or Postgres),
 | **ensure-moderation-bots-in-rooms.sh** | Standalone script (same logic as CronJob); for VM or one-off run. |
 | **nginx-configmap-federation.yaml** | Optional: nginx config with federation allowed and .well-known/matrix/server for federation tests. |
 | **TEST-MATRIX.md** | Full test matrix: every feature and workflow (auth, rooms, E2EE, file share, voice/video calls, moderation bots, optional email) |
+| **SMALL-CLUSTER.md** | Running on 1 vCPU / 1 GiB: minikube flags, resource budget (00-budget.yaml), per-component limits, load-test tips for calls. |
 
 ## Deploy
 
@@ -128,6 +133,37 @@ MATRIX_REGISTRATION_SHARED_SECRET=your-secret ./k8s-qa/run-matrix-qa-tests.sh
 ```
 
 Exit code 0 = all tests passed.
+
+### Run only some tests (faster iteration)
+
+Deploy once, then run a subset of tests repeatedly without re-deploying:
+
+```bash
+# 1) Deploy and start port-forward (no tests). Script stays in foreground (Ctrl+C stops port-forwards).
+./k8s-qa/deploy-only.sh
+
+# 2) In another terminal (or after deploy-only, in same shell if you background it): run quick tests only
+./k8s-qa/run-quick-tests.sh
+# Quick tests = versions, federation_blocked, wellknown_client, metrics (no login/rooms)
+
+# 3) Run a single test by id (e.g. fix metrics, then re-run only that)
+MATRIX_QA_TESTS=metrics ./k8s-qa/run-matrix-qa-tests.sh
+
+# 4) Run a few tests by id
+MATRIX_QA_TESTS=versions,wellknown_client,metrics ./k8s-qa/run-matrix-qa-tests.sh
+
+# 5) Skip specific tests
+MATRIX_QA_SKIP=rate_limit,file_upload ./k8s-qa/run-matrix-qa-tests.sh
+
+# 6) List all test ids
+./k8s-qa/run-matrix-qa-tests.sh --list-tests
+```
+
+| Script | Purpose |
+|--------|---------|
+| **deploy-only.sh** | Deploy stack + port-forward; no tests. Use once, then run test subsets in a loop. |
+| **run-quick-tests.sh** | Run only versions, federation (blocked or allowed), wellknown client, metrics. |
+| **run-matrix-qa-tests.sh** | Full suite; use `MATRIX_QA_TESTS=id1,id2` or `MATRIX_QA_SKIP=id1,id2` to filter. |
 
 ## Optional: fail2ban / msmtp email in the workflow
 

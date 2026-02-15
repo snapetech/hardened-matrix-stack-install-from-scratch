@@ -49,6 +49,15 @@ Comprehensive test matrix for the hardened Matrix stack. All tests are designed 
 
 ## Running the full matrix
 
+### Two-phase (recommended: no-federation first, then federation + blocklists)
+
+```bash
+./k8s-qa/run-full-qa-two-phase.sh
+```
+
+- **Phase 1:** Deploy with default nginx (no federation). Runs all tests: API, rooms, E2EE, file, Coturn, LiveKit/calls, moderation bots (in-room + admin PL), subscribe-Draupnir command, optional email if Secret exists.
+- **Phase 2:** Applies `nginx-configmap-federation.yaml`, restarts nginx, runs tests with `FEDERATION_ENABLED=1`: federation allowed, `.well-known/matrix/server` 200, subscribe Draupnir to CME again (with federation on, bot can join remote list room). Creates `matrix-qa-admin` Secret if missing so moderation bots are always tested.
+
 ### In Kubernetes (headless)
 
 1. **Deploy full stack** (Synapse + Postgres + LiveKit + lk-jwt):

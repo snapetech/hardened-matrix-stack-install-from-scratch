@@ -118,7 +118,23 @@ docker inspect -f '{{.State.Running}}' mjolnir 2>/dev/null | grep -qx true
 WRAP
 chmod +x /usr/local/bin/check-docker-draupnir.sh /usr/local/bin/check-docker-mjolnir.sh
 
+# Resource-delta script: only alert when over threshold AND value changed by >= delta since last alert (no repeat alerts for same level)
+RESOURCE_DELTA_SCRIPT="/usr/local/bin/monit-resource-delta.sh"
+RESOURCE_DELTA_SRC=""
+[ -n "${REPO_DIR:-}" ] && [ -f "${REPO_DIR}/monit-resource-delta.sh" ] && RESOURCE_DELTA_SRC="${REPO_DIR}/monit-resource-delta.sh"
+[ -z "$RESOURCE_DELTA_SRC" ] && [ -f "$(dirname "$0")/monit-resource-delta.sh" ] && RESOURCE_DELTA_SRC="$(cd "$(dirname "$0")" && pwd)/monit-resource-delta.sh"
+[ -z "$RESOURCE_DELTA_SRC" ] && [ -f "./monit-resource-delta.sh" ] && RESOURCE_DELTA_SRC="$(pwd)/monit-resource-delta.sh"
+if [ -n "$RESOURCE_DELTA_SRC" ]; then
+  cp "$RESOURCE_DELTA_SRC" "$RESOURCE_DELTA_SCRIPT"
+  chmod +x "$RESOURCE_DELTA_SCRIPT"
+else
+  echo "  Warning: monit-resource-delta.sh not found; using built-in Monit resource checks (may repeat alerts)." >&2
+fi
+mkdir -p /var/lib/monit/resource-state
+chmod 700 /var/lib/monit/resource-state 2>/dev/null || true
+
 MONITRC="/etc/monit/monitrc"
+# Alerts only on state change (no reminder). Resource checks use delta script so we only alert when value moves by another X%.
 cat > "$MONITRC" << EOF
 set daemon 60
 set mailserver smtp.gmail.com port 587
@@ -127,6 +143,25 @@ set mailserver smtp.gmail.com port 587
 
 set alert ${ALERT_EMAIL}
 
+EOF
+# Resource checks: only fail (alert) when over threshold AND change since last alert >= delta (memory/swap/disk: %, load: absolute)
+if [ -x "$RESOURCE_DELTA_SCRIPT" ]; then
+  cat >> "$MONITRC" << 'MONITRES'
+check program monit-load with path "/usr/local/bin/monit-resource-delta.sh load 2 0.5"
+  if status != 0 then alert
+
+check program monit-memory with path "/usr/local/bin/monit-resource-delta.sh memory 85 10"
+  if status != 0 then alert
+
+check program monit-swap with path "/usr/local/bin/monit-resource-delta.sh swap 50 10"
+  if status != 0 then alert
+
+check program monit-disk with path "/usr/local/bin/monit-resource-delta.sh disk 85 10"
+  if status != 0 then alert
+
+MONITRES
+else
+  cat >> "$MONITRC" << EOF
 check system \$HOST
   if loadavg (1min) > 2 for 5 cycles then alert
   if memory usage > 85% for 5 cycles then alert
@@ -135,6 +170,9 @@ check system \$HOST
 check filesystem root with path /
   if space usage > 85% then alert
 
+EOF
+fi
+cat >> "$MONITRC" << EOF
 check program nginx with path "/bin/systemctl is-active --quiet nginx"
   if status != 0 then alert
 

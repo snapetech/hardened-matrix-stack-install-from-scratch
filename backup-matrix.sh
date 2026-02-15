@@ -24,6 +24,19 @@ for arg in "$@"; do
   fi
 done
 OUTPUT_DIR="${OUTPUT_DIR:-/var/backups/matrix}"
+
+# Safety guard: refuse dangerous output dirs (avoid rm -rf blast radius on prune).
+case "$OUTPUT_DIR" in
+  ""|"/"|"/var"|"/usr"|"/etc"|"/tmp"|"/root"|"/home")
+    echo "Refusing to run with OUTPUT_DIR=$OUTPUT_DIR (use a dedicated subdir, e.g. /var/backups/matrix)" >&2
+    exit 2
+    ;;
+esac
+if [ -d "$OUTPUT_DIR" ] && [ "$(cd "$OUTPUT_DIR" && pwd)" = "/" ]; then
+  echo "Refusing OUTPUT_DIR that resolves to /" >&2
+  exit 2
+fi
+
 STAMP=$(date +%Y%m%d-%H%M%S)
 DEST="${OUTPUT_DIR}/${STAMP}"
 umask 077

@@ -51,6 +51,9 @@ spec:
                   key: POSTGRES_PASSWORD
             - name: POSTGRES_DB
               value: synapse
+            # Synapse requires C locale (see docs/postgres.md). Only applies on first init.
+            - name: POSTGRES_INITDB_ARGS
+              value: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
           ports:
             - containerPort: 5432
           volumeMounts:

@@ -19,9 +19,11 @@ spec:
   ports:
     - port: 3478
       targetPort: 3478
+      protocol: UDP
       name: turn-udp
     - port: 3478
       targetPort: 3478
+      protocol: TCP
       name: turn-tcp
   selector:
     app: coturn
