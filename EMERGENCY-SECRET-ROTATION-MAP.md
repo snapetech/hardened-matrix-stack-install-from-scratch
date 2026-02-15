@@ -111,6 +111,10 @@ Rotate in this order to avoid broken links. Items that can be done in parallel a
 
 - **Self-signed cert (QA):** Replace `/etc/nginx/ssl/matrix-selfsigned.{crt,key}` (generate new with openssl), then `systemctl reload nginx`.
 
+**Certbot auto-renew:** The installer enables `certbot.timer` and sets `renew_before_expiry = 21 days` in renewal configs (renew when 21 days or less left). On existing installs, run `sudo ./configure-certbot-auto-renew.sh` (env: `MATRIX_DOMAIN`, `ROOT_DOMAIN` optional; `RENEW_BEFORE_DAYS=21` default).
+
+**Rotation script Phase A:** The rotation script keeps forced renewals; if Certbot fails (e.g. Let's Encrypt rate limit: “too many certificates in 7 days”), Phase A is skipped and the script continues. An **ALERT** is printed to stderr so the user is notified. Current certs are unchanged; retry after the rate window.
+
 ---
 
 ### Phase B – Database and Synapse core (one restart)
@@ -257,4 +261,4 @@ TLS → nginx reload. Then update DB password, registration secret, TURN (file +
 - **SSH host keys:** Rotate separately (e.g. `ssh-keygen`, update known_hosts elsewhere).
 - **Other appservices:** If you add more bridges/appservices, add their tokens and registration files to this map using the same pattern as Discord.
 
-**Rotation script:** `./rotate-secrets.sh` runs a dry-run by default (no changes). Use `--execute` to perform rotation. Phases A–D are always automated (TLS, DB + registration, TURN, LiveKit). Phases E–G are automated when env is set: set **`ADMIN_ACCESS_TOKEN`** (Synapse admin token) to rotate Draupnir and Mjolnir access tokens and Maubot password; set **`DISCORD_NEW_BOT_TOKEN`** (new token from Discord Developer Portal) to update the bridge and regenerate appservice registration. Optional **`SERVER_NAME`** (default `ROOT_DOMAIN`) for MXIDs. Always run `backup-keys-pre-rotation.sh` first; the rotation script checks that a backup exists before `--execute`.
+**Rotation script:** `./rotate-secrets.sh` runs a dry-run by default (no changes). Use `--execute` to perform rotation. Phases A–D are always automated (TLS, DB + registration, TURN, LiveKit). Phases E–G are automated when env is set: **`ADMIN_ACCESS_TOKEN`** (Synapse admin token) for Draupnir, Mjolnir, and Maubot—if unset, the script tries `secret-tool lookup service matrix-admin user "$MATRIX_DOMAIN"` (store your token with `secret-tool store service matrix-admin user matrix.example.com`). **`DISCORD_NEW_BOT_TOKEN`** (new token from Discord Developer Portal) for the bridge; Phase G skips gracefully if Discord is not set up or registration generation fails. Optional **`SERVER_NAME`** (default `ROOT_DOMAIN`) for MXIDs. Always run `backup-keys-pre-rotation.sh` first; the rotation script checks that a backup exists before `--execute`.

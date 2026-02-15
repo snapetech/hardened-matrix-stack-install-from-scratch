@@ -380,6 +380,24 @@ setup_nginx_tls() {
     fi
     SSL_CERT_PATH="/etc/letsencrypt/live/$MATRIX_DOMAIN/fullchain.pem"
     SSL_KEY_PATH="/etc/letsencrypt/live/$MATRIX_DOMAIN/privkey.pem"
+    # Auto-renew: enable certbot timer and renew when 21 days or less left (aggressive buffer)
+    if [ -f /lib/systemd/system/certbot.timer ] || [ -f /usr/lib/systemd/system/certbot.timer ]; then
+      systemctl enable certbot.timer 2>/dev/null || true
+      systemctl start certbot.timer 2>/dev/null || true
+      echo "  Certbot timer enabled (auto-renew)."
+    fi
+    for dom in "$MATRIX_DOMAIN" "$ROOT_DOMAIN"; do
+      [ -z "$dom" ] && continue
+      for conf in /etc/letsencrypt/renewal/"$dom".conf /etc/letsencrypt/renewal/"$dom"-*.conf; do
+        [ -f "$conf" ] || continue
+        if grep -q 'renew_before_expiry' "$conf" 2>/dev/null; then
+          sed -i 's/^renew_before_expiry.*/renew_before_expiry = 21 days/' "$conf"
+        else
+          sed -i '/\[renewalparams\]/a renew_before_expiry = 21 days' "$conf" 2>/dev/null || true
+        fi
+      done
+    done
+    echo "  Certbot renewal set to run when cert has 21 days or less left."
   fi
 
   # Matrix site: 80 -> 301 https, 443 -> proxy to Synapse + static well-known

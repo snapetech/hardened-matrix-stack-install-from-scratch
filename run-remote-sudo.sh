@@ -3,8 +3,8 @@
 # Uses exactly one newline after the password (printf '%s\n') so sudo -S gets it correctly.
 #
 # Usage:
-#   ./run-remote-sudo.sh <user@host> [script.sh]
-#   cat script.sh | ./run-remote-sudo.sh <user@host>
+#   ./run-remote-sudo.sh <user@host> [script.sh] [script args...]
+#   cat script.sh | ./run-remote-sudo.sh <user@host> [script args...]
 #
 # Keyring: secret-tool lookup service "sudo-remote" user "<user@host>"
 #
@@ -18,12 +18,14 @@ PASS=$(secret-tool lookup service sudo-remote user "$REMOTE" 2>/dev/null) || {
   exit 1
 }
 
-if [[ -n "${1:-}" ]]; then
+if [[ -n "${1:-}" ]] && [[ -f "${1:-}" ]]; then
   SCRIPT=$(cat "$1")
-else
+  shift
+fi
+if [[ -z "${SCRIPT:-}" ]]; then
   SCRIPT=$(cat)
 fi
 
-# One newline after password (sudo -S reads until newline). Then script. Remote runs with set -e; one failure = exit.
-( printf '%s\n' "$PASS"; printf '%s' "$SCRIPT" ) | ssh "$REMOTE" 'set -e; sudo -S -p "" bash -s'
+# One newline after password (sudo -S reads until newline). Then script. Any remaining args are passed to the script (use ROTATE_EXECUTE=1 for rotate-secrets when piping to avoid --execute through ssh).
+( printf '%s\n' "$PASS"; printf '%s' "$SCRIPT" ) | ssh "$REMOTE" 'set -e; sudo -S -p "" bash -s "$@"' "" "$@"
 exit $?
