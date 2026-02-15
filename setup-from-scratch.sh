@@ -7,6 +7,8 @@
 #
 # Usage: sudo ./setup-from-scratch.sh
 #    or: copy this repo to the server and run from the repo root.
+# Re-runnable: run again to add previously skipped components or remove ones no longer
+# selected (optional components are stopped/disabled or config removed when deselected).
 # Non-interactive (QA / automation): set NON_INTERACTIVE=1 and env vars (MATRIX_DOMAIN,
 # SERVER_NAME, ROOT_DOMAIN, LE_EMAIL, FEDERATION, INSTALL_*). Use USE_SELF_SIGNED_CERT=1
 # to skip Let's Encrypt and use a self-signed cert (e.g. when no real DNS).
@@ -72,6 +74,7 @@ allow_container_services() {
   fi
 }
 svc_enable() { [ "$NO_SYSTEMD" = "0" ] && systemctl enable "$1" 2>/dev/null || true; }
+svc_disable() { [ "$NO_SYSTEMD" = "0" ] && systemctl disable "$1" 2>/dev/null || true; }
 svc_stop() {
   local s="$1"
   if [ "$NO_SYSTEMD" = "1" ]; then
@@ -464,7 +467,16 @@ NGINX_ROOT
 # ========== Phase 6: Coturn (TURN secret) ==========
 setup_coturn() {
   echo "[6/14] Configuring coturn..."
-  if [ "$INSTALL_COTURN" != "y" ]; then return 0; fi
+  if [ "$INSTALL_COTURN" != "y" ]; then
+    if [ -f /etc/matrix-synapse/conf.d/turn.yaml ]; then
+      rm -f /etc/matrix-synapse/conf.d/turn.yaml
+      svc_restart matrix-synapse
+      echo "  Coturn disabled: turn config removed from Synapse."
+    fi
+    svc_stop coturn 2>/dev/null || true
+    svc_disable coturn 2>/dev/null || true
+    return 0
+  fi
   TURN_SECRET="${TURN_SECRET:-$(openssl rand -hex 32)}"
   echo -n "$TURN_SECRET" > /root/.matrix-turn-secret
   chmod 600 /root/.matrix-turn-secret
@@ -500,7 +512,16 @@ EOF
 # ========== Phase 7: Optional monitoring (Netdata OR Prometheus, not both) ==========
 setup_monitoring() {
   echo "[7/14] Optional: Monitoring ($MONITORING_BACKEND)..."
-  if [ "$MONITORING_BACKEND" = "none" ]; then return 0; fi
+  if [ "$MONITORING_BACKEND" = "none" ]; then
+    svc_stop netdata 2>/dev/null || true
+    svc_disable netdata 2>/dev/null || true
+    svc_stop prometheus 2>/dev/null || true
+    svc_disable prometheus 2>/dev/null || true
+    svc_stop node_exporter 2>/dev/null || true
+    svc_disable node_exporter 2>/dev/null || true
+    echo "  Monitoring disabled (netdata/prometheus stopped and disabled)."
+    return 0
+  fi
 
   if [ "$MONITORING_BACKEND" = "netdata" ]; then
     if ! command -v netdata &>/dev/null; then
@@ -594,7 +615,16 @@ PROMEOF
 # ========== Phase 8: Metrics-auth proxy (gate Netdata or Prometheus behind Synapse login) ==========
 setup_metrics_auth() {
   echo "[8/14] Metrics-auth proxy (gate metrics behind Synapse login)..."
-  if [ "$MONITORING_BACKEND" = "none" ] || [ "$INSTALL_METRICS_AUTH" != "y" ]; then return 0; fi
+  if [ "$MONITORING_BACKEND" = "none" ] || [ "$INSTALL_METRICS_AUTH" != "y" ]; then
+    if grep -q "metrics-auth/validate" /etc/nginx/sites-available/matrix 2>/dev/null; then
+      sed -i '/include \/etc\/nginx\/snippets\/metrics-netdata.conf/d' /etc/nginx/sites-available/matrix
+      nginx -t 2>/dev/null && svc_reload nginx
+      echo "  Metrics-auth: nginx snippet removed."
+    fi
+    svc_stop metrics-auth-proxy 2>/dev/null || true
+    svc_disable metrics-auth-proxy 2>/dev/null || true
+    return 0
+  fi
   mkdir -p /opt/metrics-auth
   [ -f "$REPO_DIR/metrics-auth-proxy.py" ] && cp "$REPO_DIR/metrics-auth-proxy.py" /opt/metrics-auth/ && chmod 755 /opt/metrics-auth/metrics-auth-proxy.py
   [ -f "$REPO_DIR/metrics-auth-proxy.service" ] && sed "s|https://matrix.example.com|https://$MATRIX_DOMAIN|g" "$REPO_DIR/metrics-auth-proxy.service" > /etc/systemd/system/metrics-auth-proxy.service
@@ -655,7 +685,28 @@ EOF
 # ========== Phase 9: Element Call / LiveKit (Docker) ==========
 setup_element_call() {
   echo "[9/14] Element Call / LiveKit (Docker)..."
-  if [ "$INSTALL_ELEMENT_CALL" != "y" ]; then return 0; fi
+  if [ "$INSTALL_ELEMENT_CALL" != "y" ]; then
+    if grep -q "element-call-livekit.conf" /etc/nginx/sites-available/matrix 2>/dev/null; then
+      sed -i '/include \/etc\/nginx\/snippets\/element-call-livekit.conf/d' /etc/nginx/sites-available/matrix
+      nginx -t 2>/dev/null && svc_reload nginx
+    fi
+    rm -f /etc/matrix-synapse/conf.d/experimental-element-call.yaml 2>/dev/null || true
+    CLIENT_WELLKNOWN="/var/www/matrix-well-known/.well-known/matrix/client"
+    if [ -f "$CLIENT_WELLKNOWN" ]; then
+      python3 -c "
+import json
+p = '$CLIENT_WELLKNOWN'
+with open(p) as f: d = json.load(f)
+d.pop('org.matrix.msc4143.rtc_foci', None)
+with open(p, 'w') as f: json.dump(d, f, indent=2)
+" 2>/dev/null || true
+    fi
+    if [ -d /opt/element-call ] && [ -f /opt/element-call/docker-compose.yml ]; then
+      (cd /opt/element-call && docker compose down 2>/dev/null || docker-compose down 2>/dev/null || true)
+      echo "  Element Call disabled (containers stopped, nginx and Synapse config removed)."
+    fi
+    return 0
+  fi
   # Install Docker if not present
   if ! command -v docker &>/dev/null; then
     curl -fsSL https://get.docker.com | sh
@@ -760,6 +811,10 @@ EOF
 # ========== Phase 10: Fail2ban + nginx hardening ==========
 setup_fail2ban_nginx_hardening() {
   echo "[10/14] Fail2ban + nginx hardening..."
+  if [ "$INSTALL_FAIL2BAN" != "y" ]; then
+    svc_stop fail2ban 2>/dev/null || true
+    svc_disable fail2ban 2>/dev/null || true
+  fi
   if [ "$INSTALL_FAIL2BAN" = "y" ]; then
     [ -f "$REPO_DIR/fail2ban-matrix/filter.d/matrix-synapse-auth.conf" ] && cp "$REPO_DIR/fail2ban-matrix/filter.d/matrix-synapse-auth.conf" /etc/fail2ban/filter.d/
     mkdir -p /etc/fail2ban/jail.d
@@ -783,10 +838,58 @@ setup_fail2ban_nginx_hardening() {
   echo "  Fail2ban and nginx hardening applied."
 }
 
+# ========== Phase 10b: OpenSSH post-quantum KEX (idempotent) ==========
+setup_openssh_pq() {
+  echo "[10b] OpenSSH post-quantum key exchange..."
+  SSHD_CONFIG="/etc/ssh/sshd_config"
+  PQ_KEX="sntrup761x25519-sha512@openssh.com,mlkem768x25519-sha256"
+  FALLBACK_KEX="curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha256"
+  NEW_KEX="${PQ_KEX},${FALLBACK_KEX}"
+
+  if ! ssh -Q kex 2>/dev/null | grep -qE "sntrup761|mlkem768"; then
+    echo "  OpenSSH on this host does not support post-quantum KEX (need 9.0+). Skipping."
+    return 0
+  fi
+  CURRENT_FIRST=$(sshd -T 2>/dev/null | grep -i kexalgorithms | sed 's/^[^ ]* *//' | cut -d',' -f1 || true)
+  if [ -n "$CURRENT_FIRST" ] && echo "$CURRENT_FIRST" | grep -qE "^(sntrup761|mlkem768)"; then
+    echo "  KexAlgorithms already PQ-first. Skipping."
+    return 0
+  fi
+  if [ -f "$SSHD_CONFIG" ] && grep -qE "^[[:space:]]*KexAlgorithms[[:space:]]+" "$SSHD_CONFIG"; then
+    FIRST_KEX=$(grep -E "^[[:space:]]*KexAlgorithms[[:space:]]+" "$SSHD_CONFIG" | head -1 | sed 's/^[[:space:]]*KexAlgorithms[[:space:]]*//' | cut -d',' -f1)
+    if echo "$FIRST_KEX" | grep -qE "^(sntrup761|mlkem768)"; then
+      echo "  KexAlgorithms already PQ-first in config. Skipping."
+      return 0
+    fi
+  fi
+
+  BACKUP="${SSHD_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+  cp -a "$SSHD_CONFIG" "$BACKUP"
+  if grep -qE "^[[:space:]]*KexAlgorithms[[:space:]]" "$SSHD_CONFIG"; then
+    sed -i "s/^[[:space:]]*KexAlgorithms[[:space:]]*.*/KexAlgorithms ${NEW_KEX}/" "$SSHD_CONFIG"
+  else
+    echo "KexAlgorithms ${NEW_KEX}" >> "$SSHD_CONFIG"
+  fi
+  if ! sshd -t 2>/dev/null; then
+    cp -a "$BACKUP" "$SSHD_CONFIG"
+    echo "  sshd -t failed; config restored. Skipping."
+    return 0
+  fi
+  if systemctl reload ssh 2>/dev/null; then :; elif systemctl reload sshd 2>/dev/null; then :; else
+    echo "  Reload failed; try: sudo systemctl restart ssh"
+    return 0
+  fi
+  echo "  Post-quantum KEX enabled (new connections use PQ)."
+}
+
 # ========== Phase 11: Backup script + cron ==========
 setup_backup() {
   echo "[11/14] Backup script and cron..."
-  if [ "$INSTALL_BACKUP_CRON" != "y" ]; then return 0; fi
+  if [ "$INSTALL_BACKUP_CRON" != "y" ]; then
+    (crontab -l 2>/dev/null | grep -v "backup-matrix.sh") | crontab - 2>/dev/null || true
+    echo "  Backup cron removed."
+    return 0
+  fi
   mkdir -p /opt/matrix-backup
   # Copy whole repo so backup and future deploys have all configs
   if [ -d "$REPO_DIR" ] && [ -f "$REPO_DIR/backup-matrix.sh" ]; then
@@ -805,7 +908,11 @@ setup_backup() {
 # ========== Phase 12: Moderation bot (Draupnir or Mjolnir, Docker) ==========
 setup_draupnir() {
   echo "[12/14] Draupnir (moderation bot)..."
-  if [ "$INSTALL_MODERATION_BOT" != "draupnir" ]; then return 0; fi
+  if [ "$INSTALL_MODERATION_BOT" != "draupnir" ]; then
+    docker stop draupnir 2>/dev/null || true
+    docker rm draupnir 2>/dev/null || true
+    return 0
+  fi
   if ! command -v docker &>/dev/null; then
     echo "  Docker not installed; skipping Draupnir. Install Docker and run setup-draupnir.sh from this repo."
     return 0
@@ -873,7 +980,11 @@ EOF
 
 setup_mjolnir() {
   echo "[12/14] Mjolnir (moderation bot)..."
-  if [ "$INSTALL_MODERATION_BOT" != "mjolnir" ]; then return 0; fi
+  if [ "$INSTALL_MODERATION_BOT" != "mjolnir" ]; then
+    docker stop mjolnir 2>/dev/null || true
+    docker rm mjolnir 2>/dev/null || true
+    return 0
+  fi
   if ! command -v docker &>/dev/null; then
     echo "  Docker not installed; skipping Mjolnir. Install Docker and run setup-mjolnir.sh from this repo."
     return 0
@@ -1068,6 +1179,7 @@ main() {
   setup_metrics_auth
   setup_element_call
   setup_fail2ban_nginx_hardening
+  setup_openssh_pq
   setup_backup
   setup_draupnir
   setup_mjolnir

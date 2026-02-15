@@ -5,7 +5,8 @@
 # Example (self-signed, minimal options):
 #   sudo -E ./run-qa-noninteractive.sh
 #
-# Env vars (all optional when NON_INTERACTIVE=1):
+# Env vars (all optional when NON_INTERACTIVE=1) define desired state; re-run with
+# different values to add or remove components (e.g. INSTALL_MONITORING=n to disable monitoring).
 #   MATRIX_DOMAIN, SERVER_NAME, ROOT_DOMAIN, LE_EMAIL
 #   FEDERATION, INSTALL_COTURN, INSTALL_MONITORING, INSTALL_ELEMENT_CALL, INSTALL_FAIL2BAN,
 #   INSTALL_BACKUP_CRON, INSTALL_MJOLNIR, INSTALL_MAUBOT, INSTALL_DISCORD, INSTALL_METRICS_AUTH

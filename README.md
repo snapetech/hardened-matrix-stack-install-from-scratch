@@ -47,10 +47,11 @@ The script prompts for:
 6. **Metrics-auth (optional, when monitoring installed):** Python proxy on 127.0.0.1:9091; nginx locations for `/metrics-auth/` (login/validate) and gated `/metrics/` (Netdata or Prometheus UI); login with Matrix account.
 7. **Element Call (optional):** Docker + LiveKit server + lk-jwt-service; `/opt/element-call` with `docker-compose.yml`, `livekit.yaml`, `.env`; nginx `/livekit/jwt` and `/livekit/sfu`; Synapse experimental MSCs (3266, 4222, 4140) and `.well-known` rtc_foci.
 8. **Fail2ban + nginx hardening:** Filter/jail for Synapse auth; rate-limit zones and hardening snippet.
-9. **Backup:** `/opt/matrix-backup/backup-matrix.sh` and cron at 03:00.
-10. **Moderation bot (optional, one of):** **Draupnir** (recommended) or **Mjolnir**; creates `@draupnir` or `@mjolnir:SERVER_NAME`, management room, token; runs in Docker. See [DRAUPNIR-INTEGRATION.md](DRAUPNIR-INTEGRATION.md) for remote activation.
-11. **Maubot (optional):** Creates `@maubot:SERVER_NAME`; writes `/opt/maubot/config.yaml`. You run Maubot (pip or Docker) yourself.
-12. **Discord bridge (optional):** Writes `/opt/discord-bridge/config.yaml`; if `npx` is available, generates registration and adds Synapse appservice config; you start the bridge (Node or Docker).
+9. **OpenSSH post-quantum KEX (idempotent):** Enables PQ-first `KexAlgorithms` to fix "store now, decrypt later" warning (OpenSSH 9.0+); skips if already set.
+10. **Backup:** `/opt/matrix-backup/backup-matrix.sh` and cron at 03:00.
+11. **Moderation bot (optional, one of):** **Draupnir** (recommended) or **Mjolnir**; creates `@draupnir` or `@mjolnir:SERVER_NAME`, management room, token; runs in Docker. See [DRAUPNIR-INTEGRATION.md](DRAUPNIR-INTEGRATION.md) for remote activation.
+12. **Maubot (optional):** Creates `@maubot:SERVER_NAME`; writes `/opt/maubot/config.yaml`. You run Maubot (pip or Docker) yourself.
+13. **Discord bridge (optional):** Writes `/opt/discord-bridge/config.yaml`; if `npx` is available, generates registration and adds Synapse appservice config; you start the bridge (Node or Docker).
 
 ## Non-interactive / QA
 
@@ -62,6 +63,8 @@ sudo -E ./run-qa-noninteractive.sh
 ```
 
 Defaults: `MATRIX_DOMAIN=matrix.qa.local`, `SERVER_NAME=qa.local`, `USE_SELF_SIGNED_CERT=1`. Override with env vars (see script). Set `ADMIN_PASSWORD` to create the first admin user without a prompt. Full installation requires a real Debian/Ubuntu system (or VM) with systemd; the script will fail in a minimal container without running PostgreSQL/nginx.
+
+**Re-running the installer:** The script is re-runnable. Run it again with the same or different options: it will add previously skipped components (idempotent) and **remove or disable** optional components that you no longer select (e.g. set monitoring to none, or moderation bot to none). This applies to monitoring, metrics-auth, Element Call, fail2ban, backup cron, coturn, and Draupnir/Mjolnir.
 
 ## Testing in Kubernetes
 
@@ -106,6 +109,7 @@ For long-running or one-off remote commands (e.g. load test, deploys), use **scr
   Or pipe a script: `cat script.sh | ./run-remote-in-screen.sh lukano@timeways.net <session_name> [-w]`  
   Attach: `ssh lukano@timeways.net` then `screen -r <session_name>`. With `-w`, the script waits for the screen to exit then runs `screen -wipe`.
 - **Sudo (once, no retries):** `./run-remote-sudo.sh lukano@timeways.net script.sh`
+- **Post-quantum SSH (fix "store now, decrypt later" warning):** `cat fix-openssh-pq-remote.sh | ./run-remote-sudo.sh user@host` — enables PQ key exchange on the server so new connections no longer warn.
 
 ## License
 
