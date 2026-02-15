@@ -2,7 +2,8 @@
 # Set up lightweight email alerts on a VPS: msmtp (sendmail shim), fail2ban mail,
 # Monit (host/service alerts), and a daily digest via systemd timer.
 # Run on server: sudo ./setup-email-alerts.sh
-# Env: ALERT_EMAIL (optional; prompted if unset), MSMTP_APP_PASSWORD (optional; prompted if unset).
+# Env: ALERT_EMAIL (optional; prompted if unset), MSMTP_APP_PASSWORD (optional; prompted if unset),
+#       ROUTE_ROOT_MAIL_PROMPT=1 to skip "route root mail?" prompt (default Y).
 # For Gmail you must use an App Password (not your normal password). Create one at:
 #   https://myaccount.google.com/apppasswords
 #   (Help: https://support.google.com/accounts/answer/185833)
@@ -30,6 +31,14 @@ fi
 # Strip spaces (e.g. user pastes "xxxx xxxx xxxx xxxx")
 MSMTP_APP_PASSWORD=$(echo "$MSMTP_APP_PASSWORD" | tr -d '[:space:]')
 
+# --- Optional: route root/postmaster mail to alert email via msmtp ---
+ROUTE_ROOT_MAIL=Y
+if [ -z "${ROUTE_ROOT_MAIL_PROMPT:-}" ]; then
+  read -p "Route root/postmaster mail to alert email (cron, etc.)? [Y/n] " r
+  ROUTE_ROOT_MAIL=$(echo "${r:-Y}" | tr '[:upper:]' '[:lower:]')
+  [ "$ROUTE_ROOT_MAIL" = "n" ] && ROUTE_ROOT_MAIL=n || ROUTE_ROOT_MAIL=Y
+fi
+
 # --- Install packages ---
 apt-get update -qq
 apt-get install -y -qq msmtp msmtp-mta bsd-mailx monit
@@ -42,6 +51,9 @@ tls on
 tls_starttls on
 tls_trust_file /etc/ssl/certs/ca-certificates.crt
 logfile /var/log/msmtp.log
+EOF
+[ "$ROUTE_ROOT_MAIL" = "Y" ] && echo "aliases /etc/aliases.msmtp" >> /etc/msmtprc
+cat >> /etc/msmtprc << EOF
 
 account default
 host smtp.gmail.com
@@ -54,6 +66,28 @@ printf '%s' "$MSMTP_APP_PASSWORD" > /etc/msmtp.pass
 chmod 600 /etc/msmtp.pass /etc/msmtprc
 touch /var/log/msmtp.log
 chmod 640 /var/log/msmtp.log
+
+if [ "$ROUTE_ROOT_MAIL" = "Y" ]; then
+  # So all mail to root (cron, system) goes via msmtp to ALERT_EMAIL
+  echo "root: ${ALERT_EMAIL}" > /etc/aliases.msmtp
+  echo "postmaster: ${ALERT_EMAIL}" >> /etc/aliases.msmtp
+  chmod 644 /etc/aliases.msmtp
+  # Also update system /etc/aliases so any tool that reads it forwards root
+  if [ -f /etc/aliases ]; then
+    if grep -q '^root:' /etc/aliases; then
+      sed -i "s|^root:.*|root: ${ALERT_EMAIL}|" /etc/aliases
+    else
+      echo "root: ${ALERT_EMAIL}" >> /etc/aliases
+    fi
+    if ! grep -q '^postmaster:' /etc/aliases; then
+      echo "postmaster: root" >> /etc/aliases
+    fi
+    newaliases 2>/dev/null || true
+  else
+    printf '%s\n' "root: ${ALERT_EMAIL}" "postmaster: root" > /etc/aliases
+    newaliases 2>/dev/null || true
+  fi
+fi
 
 # --- Fail2ban: email on bans ---
 mkdir -p /etc/fail2ban/jail.d
@@ -222,10 +256,18 @@ EOF
 systemctl daemon-reload
 systemctl enable --now vps-digest.timer 2>/dev/null || true
 
-# --- Test mail ---
+# --- Test mail (direct; optional root test) ---
 echo ""
 echo "Sending test email to ${ALERT_EMAIL}..."
 echo "Email alerts test from $(hostname -f 2>/dev/null || hostname). msmtp + Monit + daily digest are configured." | mail -s "VPS email alerts test" "$ALERT_EMAIL" 2>/dev/null || true
-echo "  Check your inbox. If no mail, check /var/log/msmtp.log and Gmail App Password."
-echo ""
-echo "Done. Fail2ban will email on bans; Monit will alert on high load/memory/disk or service down; healthcheck every 5 min (restarts); daily digest at 08:00."
+if [ "$ROUTE_ROOT_MAIL" = "Y" ]; then
+  echo "Sending test mail to root (should arrive at ${ALERT_EMAIL})..."
+  echo "Root mail test from $(hostname -f 2>/dev/null || hostname). All root mail is forwarded via msmtp." | mail -s "Root mail test" root 2>/dev/null || true
+  echo "  Check your inbox for both messages. If no mail, check /var/log/msmtp.log and Gmail App Password."
+  echo ""
+  echo "Done. Fail2ban will email on bans; Monit will alert; healthcheck every 5 min; daily digest at 08:00; root mail -> ${ALERT_EMAIL}."
+else
+  echo "  Check your inbox. If no mail, check /var/log/msmtp.log and Gmail App Password."
+  echo ""
+  echo "Done. Fail2ban will email on bans; Monit will alert; healthcheck every 5 min; daily digest at 08:00."
+fi
