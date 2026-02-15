@@ -30,6 +30,7 @@ MONITORING_BACKEND="${MONITORING_BACKEND:-netdata}"
 INSTALL_ELEMENT_CALL="${INSTALL_ELEMENT_CALL:-n}"
 INSTALL_FAIL2BAN="${INSTALL_FAIL2BAN:-y}"
 INSTALL_BACKUP_CRON="${INSTALL_BACKUP_CRON:-y}"
+INSTALL_EMAIL_ALERTS="${INSTALL_EMAIL_ALERTS:-n}"
 # Moderation bot: exactly one of none, mjolnir, draupnir
 INSTALL_MODERATION_BOT="${INSTALL_MODERATION_BOT:-none}"
 INSTALL_MAUBOT="${INSTALL_MAUBOT:-n}"
@@ -163,7 +164,7 @@ run_prompts() {
     SERVER_NAME="${SERVER_NAME:-example.com}"
     ROOT_DOMAIN="${ROOT_DOMAIN:-$SERVER_NAME}"
     LE_EMAIL="${LE_EMAIL:-admin@$SERVER_NAME}"
-    for v in FEDERATION INSTALL_COTURN INSTALL_ELEMENT_CALL INSTALL_FAIL2BAN INSTALL_BACKUP_CRON INSTALL_MAUBOT INSTALL_DISCORD INSTALL_METRICS_AUTH; do
+    for v in FEDERATION INSTALL_COTURN INSTALL_ELEMENT_CALL INSTALL_FAIL2BAN INSTALL_BACKUP_CRON INSTALL_EMAIL_ALERTS INSTALL_MAUBOT INSTALL_DISCORD INSTALL_METRICS_AUTH; do
       eval "val=\$$v"; val="$(echo "${val:-}" | tr '[:upper:]' '[:lower:]')"
       case "$val" in ""|y|yes|1|true) eval "$v=y" ;; *) eval "$v=n" ;; esac
     done
@@ -197,6 +198,7 @@ run_prompts() {
     yesno INSTALL_ELEMENT_CALL "n" "Install Element Call / LiveKit (Docker)?"
     yesno INSTALL_FAIL2BAN "y" "Install fail2ban (login brute-force protection)?"
     yesno INSTALL_BACKUP_CRON "y" "Install backup script and daily cron?"
+    yesno INSTALL_EMAIL_ALERTS "n" "Set up email alerts (msmtp, fail2ban mail, Monit, daily digest)? (Gmail: need App Password — see https://myaccount.google.com/apppasswords)"
     # Moderation bot: exactly one of none, draupnir, mjolnir
     read -p "Moderation bot: (n)one / (d)raupnir / (m)jolnir [none]: " mod_choice
     mod_choice="${mod_choice:-none}"
@@ -219,7 +221,7 @@ run_prompts() {
     echo "  Server name (MXID): $SERVER_NAME"
     echo "  .well-known on: $ROOT_DOMAIN"
     echo "  Federation: $FEDERATION | Coturn: $INSTALL_COTURN | Monitoring: $MONITORING_BACKEND | Element Call: $INSTALL_ELEMENT_CALL"
-    echo "  Fail2ban: $INSTALL_FAIL2BAN | Backup: $INSTALL_BACKUP_CRON | Moderation: $INSTALL_MODERATION_BOT | Maubot: $INSTALL_MAUBOT | Discord: $INSTALL_DISCORD | Metrics-auth: $INSTALL_METRICS_AUTH"
+    echo "  Fail2ban: $INSTALL_FAIL2BAN | Backup: $INSTALL_BACKUP_CRON | Email alerts: $INSTALL_EMAIL_ALERTS | Moderation: $INSTALL_MODERATION_BOT | Maubot: $INSTALL_MAUBOT | Discord: $INSTALL_DISCORD | Metrics-auth: $INSTALL_METRICS_AUTH"
     read -p "Continue? (y/n) [y]: " cont
     cont="${cont:-y}"
     [[ "$cont" =~ ^[yY] ]] || exit 0
@@ -923,6 +925,68 @@ setup_backup() {
   echo "  Backup script at /opt/matrix-backup/backup-matrix.sh; cron daily at 03:00."
 }
 
+# ========== Phase 11b: Email alerts (msmtp, fail2ban mail, Monit, daily digest) ==========
+setup_email_alerts() {
+  if [ "$INSTALL_EMAIL_ALERTS" != "y" ]; then
+    return 0
+  fi
+  echo "[11b/14] Email alerts (msmtp, fail2ban mail, Monit, daily digest)..."
+  export ALERT_EMAIL="${ALERT_EMAIL:-$LE_EMAIL}"
+  if [ -f "$REPO_DIR/setup-email-alerts.sh" ]; then
+    echo "  You will be prompted for an SMTP App Password (Gmail: create at https://myaccount.google.com/apppasswords)."
+    bash "$REPO_DIR/setup-email-alerts.sh"
+  else
+    echo "  Run the email-alerts setup manually (script not found in repo):"
+    echo "    sudo ./setup-email-alerts.sh"
+    echo "  Gmail App Password: https://myaccount.google.com/apppasswords"
+    echo "  Help: https://support.google.com/accounts/answer/185833"
+  fi
+}
+
+# ========== Phase 11c: Matrix stack healthcheck (periodic restarts + Monit) ==========
+setup_healthcheck() {
+  if [ ! -f "$REPO_DIR/matrix-stack-healthcheck.sh" ]; then
+    return 0
+  fi
+  echo "[11c/14] Matrix stack healthcheck (periodic restarts, Monit check)..."
+  cp "$REPO_DIR/matrix-stack-healthcheck.sh" /usr/local/sbin/matrix-stack-healthcheck
+  chmod +x /usr/local/sbin/matrix-stack-healthcheck
+  mkdir -p /var/lib/matrix-healthcheck
+  # Systemd timer: every 5 min, run with restarts
+  mkdir -p /etc/systemd/system
+  cat > /etc/systemd/system/matrix-stack-healthcheck.service << 'EOF'
+[Unit]
+Description=Matrix stack healthcheck and auto-restart
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/matrix-stack-healthcheck
+EOF
+  cat > /etc/systemd/system/matrix-stack-healthcheck.timer << 'EOF'
+[Unit]
+Description=Run Matrix stack healthcheck every 5 minutes
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now matrix-stack-healthcheck.timer 2>/dev/null || true
+  # Add Monit check if Monit is configured
+  if [ -f /etc/monit/monitrc ] && ! grep -q "check program matrix-stack-health" /etc/monit/monitrc 2>/dev/null; then
+    cat >> /etc/monit/monitrc << 'MONITHEALTH'
+
+check program matrix-stack-health with path "/usr/local/sbin/matrix-stack-healthcheck --check-only"
+  if status != 0 then alert
+MONITHEALTH
+    monit -t 2>/dev/null && systemctl reload monit 2>/dev/null || true
+  fi
+  echo "  Healthcheck: /usr/local/sbin/matrix-stack-healthcheck (timer every 5 min; Monit check if Monit present)."
+}
+
 # ========== Phase 12: Moderation bot (Draupnir or Mjolnir, Docker) ==========
 setup_draupnir() {
   echo "[12/14] Draupnir (moderation bot)..."
@@ -1199,6 +1263,8 @@ main() {
   setup_fail2ban_nginx_hardening
   setup_openssh_pq
   setup_backup
+  setup_email_alerts
+  setup_healthcheck
   setup_draupnir
   setup_mjolnir
   setup_maubot
@@ -1225,6 +1291,8 @@ main() {
   echo "  TURN secret: /root/.matrix-turn-secret (if coturn installed)"
   echo "  Registration shared secret: in conf.d/registration.yaml (remove after creating first user if desired)"
   echo "  Backup: /opt/matrix-backup/backup-matrix.sh (cron 03:00)"
+  [ "$INSTALL_EMAIL_ALERTS" = "y" ] && echo "  Email alerts: msmtp + fail2ban mail + Monit + daily digest (08:00)"
+  [ -x /usr/local/sbin/matrix-stack-healthcheck ] && echo "  Healthcheck: /usr/local/sbin/matrix-stack-healthcheck (timer every 5 min)"
   [ "$MONITORING_BACKEND" != "none" ] && [ "$INSTALL_METRICS_AUTH" = "y" ] && echo "  Gated metrics: https://$MATRIX_DOMAIN/metrics/ (login with Matrix)"
   [ "$INSTALL_ELEMENT_CALL" = "y" ] && echo "  Element Call backend: /opt/element-call (LiveKit + lk-jwt-service)"
   [ "$INSTALL_MODERATION_BOT" = "draupnir" ] && echo "  Draupnir: Docker container draupnir"

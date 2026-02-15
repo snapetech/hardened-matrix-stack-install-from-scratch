@@ -31,6 +31,7 @@ The script prompts for:
 | **Install Element Call / LiveKit?** | n | Docker-based voice/video SFU (MatrixRTC). |
 | **Install fail2ban?** | y | Ban IPs after repeated login failures. |
 | **Install backup script and cron?** | y | Daily backup at 03:00. |
+| **Set up email alerts?** | n | msmtp (Gmail), fail2ban mail on ban, Monit, daily digest at 08:00. Needs [Gmail App Password](https://myaccount.google.com/apppasswords). |
 | **Moderation bot** | none | (n)one / (d)raupnir / (m)jolnir — Draupnir is the recommended successor to Mjolnir. |
 | **Install Maubot?** | n | Plugin bot. |
 | **Install Discord bridge?** | n | Appservice bridge. |
@@ -49,9 +50,11 @@ The script prompts for:
 8. **Fail2ban + nginx hardening:** Filter/jail for Synapse auth; rate-limit zones and hardening snippet.
 9. **OpenSSH post-quantum KEX (idempotent):** Enables PQ-first `KexAlgorithms` to fix "store now, decrypt later" warning (OpenSSH 9.0+); skips if already set.
 10. **Backup:** `/opt/matrix-backup/backup-matrix.sh` and cron at 03:00.
-11. **Moderation bot (optional, one of):** **Draupnir** (recommended) or **Mjolnir**; creates `@draupnir` or `@mjolnir:SERVER_NAME`, management room, token; runs in Docker. See [DRAUPNIR-INTEGRATION.md](DRAUPNIR-INTEGRATION.md) for remote activation.
-12. **Maubot (optional):** Creates `@maubot:SERVER_NAME`; writes `/opt/maubot/config.yaml`. You run Maubot (pip or Docker) yourself.
-13. **Discord bridge (optional):** Writes `/opt/discord-bridge/config.yaml`; if `npx` is available, generates registration and adds Synapse appservice config; you start the bridge (Node or Docker).
+11. **Email alerts (optional):** msmtp + msmtp-mta (sendmail shim), fail2ban email on ban, Monit (load/memory/disk + nginx/synapse/Docker checks), daily digest at 08:00. See **setup-email-alerts.sh** (prompts for alert email and Gmail App Password).
+12. **Healthcheck (optional):** **matrix-stack-healthcheck.sh** — systemd timer every 5 min (restart failed systemd units and Docker containers), Monit check with `--check-only`. Optional: `--clear-fail2ban` to unban all IPs in all jails; `--allow-reboot` for reboot-after-critical-failure. Log: `/var/log/matrix-healthcheck.log`.
+13. **Moderation bot (optional, one of):** **Draupnir** (recommended) or **Mjolnir**; creates `@draupnir` or `@mjolnir:SERVER_NAME`, management room, token; runs in Docker. See [DRAUPNIR-INTEGRATION.md](DRAUPNIR-INTEGRATION.md) for remote activation.
+14. **Maubot (optional):** Creates `@maubot:SERVER_NAME`; writes `/opt/maubot/config.yaml`. You run Maubot (pip or Docker) yourself.
+15. **Discord bridge (optional):** Writes `/opt/discord-bridge/config.yaml`; if `npx` is available, generates registration and adds Synapse appservice config; you start the bridge (Node or Docker).
 
 ## Non-interactive / QA
 
@@ -83,7 +86,9 @@ See **[k8s-qa/README.md](k8s-qa/README.md)** for deploy, access (NodePort / port
 - **backup-matrix.sh** — Backup script (Synapse DB, media, conf.d, server config including Element Call, Draupnir/Mjolnir, Maubot, Discord).
 - **element-call/** — `docker-compose.yml` and `livekit.yaml.template` for Element Call / LiveKit.
 - **synapse-*.yaml**, **nginx-*.conf** — Config snippets and templates. **synapse-no-federation.yaml**, **nginx-no-federation.conf** — Default no-federation (spam-free); **validate-no-federation.sh**, **apply-no-federation-remote.sh** — Validate and apply on existing servers.
-- **fail2ban-matrix/** — Filter and jail for Synapse auth.
+- **fail2ban-matrix/** — Filter and jail for Synapse auth. **fail2ban-whitelist-ssh-client.sh** (and **-remote.sh**) — whitelist your IP in sshd and unban. **matrix-stack-healthcheck.sh --clear-fail2ban** — unban all IPs in all jails.
+- **setup-email-alerts.sh** — msmtp (Gmail), fail2ban mail, Monit, daily digest; run on server (prompts for email and App Password). **matrix-stack-healthcheck.sh** — healthcheck + optional restarts; timer every 5 min; `--check-only` for Monit; `--clear-fail2ban` to clear all bans; `--allow-reboot` for reboot on repeated critical failure.
+- **backup-keys-pre-rotation.sh**, **rotate-secrets.sh** — Pre-rotation backup and emergency secret rotation (TLS, DB, TURN, LiveKit, Draupnir/Mjolnir, Maubot, Discord). See **EMERGENCY-SECRET-ROTATION-MAP.md**. **configure-certbot-auto-renew.sh** — set certbot timer and `renew_before_expiry = 21 days`.
 - **netdata/** — Netdata bind-to-localhost config for use behind nginx.
 - **metrics-auth-proxy.py**, **metrics-auth-proxy.service** — Gated metrics (Netdata or Prometheus) behind Synapse login.
 - **draupnir-production.yaml**, **setup-draupnir.sh**, **apply-draupnir-remote.sh** — Draupnir (moderation bot) config template, standalone setup, and remote deploy. See [DRAUPNIR-INTEGRATION.md](DRAUPNIR-INTEGRATION.md).
