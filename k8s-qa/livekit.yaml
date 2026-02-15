@@ -61,6 +61,9 @@ spec:
         - name: livekit
           image: livekit/livekit-server:v1.9.4
           args: ["--config", "/etc/livekit.yaml"]
+          env:
+            - name: LIVEKIT_PORT
+              value: "7880"
           ports:
             - containerPort: 7880
             - containerPort: 7881
@@ -70,8 +73,11 @@ spec:
               subPath: livekit.yaml
           resources:
             requests:
-              memory: "128Mi"
-              cpu: "50m"
+              memory: "120Mi"
+              cpu: "150m"
+            limits:
+              memory: "200Mi"
+              cpu: "300m"
       volumes:
         - name: config
           configMap:
@@ -107,6 +113,13 @@ spec:
       labels:
         app: lk-jwt
     spec:
+      # lk-jwt must reach LiveKit in-cluster (ws://livekit:7880). For OpenID validation
+      # it looks up the Matrix server by name (qa.local); make qa.local resolve to nginx
+      # so .well-known and API calls hit our proxy. (Replace with your nginx ClusterIP if different.)
+      hostAliases:
+        - ip: "10.43.101.44"
+          hostnames:
+            - "qa.local"
       containers:
         - name: lk-jwt
           image: ghcr.io/element-hq/lk-jwt-service:latest
@@ -114,9 +127,11 @@ spec:
             - name: LIVEKIT_JWT_PORT
               value: "6080"
             - name: LIVEKIT_URL
-              value: "ws://localhost:30049"
+              value: "ws://livekit:7880"
             - name: LIVEKIT_FULL_ACCESS_HOMESERVERS
               value: "*"
+            - name: LIVEKIT_INSECURE_SKIP_VERIFY_TLS
+              value: "YES_I_KNOW_WHAT_I_AM_DOING"
             - name: LIVEKIT_KEY
               valueFrom:
                 secretKeyRef:
@@ -131,5 +146,8 @@ spec:
             - containerPort: 6080
           resources:
             requests:
-              memory: "64Mi"
+              memory: "25Mi"
+              cpu: "10m"
+            limits:
+              memory: "50Mi"
               cpu: "50m"

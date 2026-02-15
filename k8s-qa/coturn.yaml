@@ -45,7 +45,7 @@ spec:
     spec:
       containers:
         - name: coturn
-          image: coturn/coturn:1.2
+          image: coturn/coturn:4.8.0-alpine
           args:
             - -c
             - /etc/coturn/turnserver.conf
@@ -62,8 +62,11 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: "64Mi"
-              cpu: "50m"
+              memory: "25Mi"
+              cpu: "10m"
+            limits:
+              memory: "70Mi"
+              cpu: "100m"
       volumes:
         - name: config
           configMap:

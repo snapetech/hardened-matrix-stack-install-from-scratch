@@ -35,7 +35,10 @@ spec:
             periodSeconds: 5
           resources:
             requests:
-              memory: "64Mi"
+              memory: "25Mi"
+              cpu: "10m"
+            limits:
+              memory: "50Mi"
               cpu: "50m"
       volumes:
         - name: config

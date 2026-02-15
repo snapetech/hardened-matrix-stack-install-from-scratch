@@ -97,7 +97,7 @@ EOF
       .venv/bin/pip install -q -r requirements.txt
     fi
     export PATH="$REPO_ROOT/load-test/.venv/bin:$PATH"
-    if .venv/bin/python scripts/create_test_users.py --config config-qa-e2e.yaml --participants "$CALL_PARTICIPANTS_GROUP2" --force 2>/dev/null; then
+    if .venv/bin/python scripts/create_test_users.py --config config-qa-e2e.yaml --participants "$CALL_PARTICIPANTS_GROUP2" --force; then
       if [ -f test_room_id.txt ]; then
         cp test_room_id.txt "$QA_ROOM_FILE"
         export TEST_ROOM_ID="$(cat test_room_id.txt)"

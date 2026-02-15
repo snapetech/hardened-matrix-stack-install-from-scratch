@@ -45,12 +45,14 @@ kubectl wait --for=condition=Ready pod -l app=postgres -n matrix-qa --timeout=60
 kubectl wait --for=condition=Ready pod -l app=coturn -n matrix-qa --timeout=60s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=livekit -n matrix-qa --timeout=60s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=lk-jwt -n matrix-qa --timeout=60s 2>/dev/null || true
-# Optional: verify Coturn port from inside cluster (non-fatal)
+# Optional: verify Coturn port from inside cluster (non-fatal; failure does not fail the run)
 if kubectl get deployment coturn -n matrix-qa &>/dev/null && [ -f "$SCRIPT_DIR/coturn-test-job.yaml" ]; then
   kubectl delete job coturn-test -n matrix-qa --ignore-not-found 2>/dev/null || true
-  kubectl apply -f "$SCRIPT_DIR/coturn-test-job.yaml" 2>/dev/null && \
-    kubectl wait --for=condition=complete job/coturn-test -n matrix-qa --timeout=30s 2>/dev/null || \
-    echo "  Coturn test job failed or skipped."
+  if kubectl apply -f "$SCRIPT_DIR/coturn-test-job.yaml" 2>/dev/null && kubectl wait --for=condition=complete job/coturn-test -n matrix-qa --timeout=30s 2>/dev/null; then
+    echo "  Coturn test job passed."
+  else
+    echo "  Coturn test job failed or skipped (optional)."
+  fi
 fi
 
 # Synapse may take longer (init: generate + postgres)
@@ -65,6 +67,7 @@ for i in $(seq 1 30); do
 done
 
 BASE_URL="${MATRIX_BASE_URL:-}"
+BASE_URL="${BASE_URL%/}"
 LIVEKIT_WS_URL="${LIVEKIT_WS_URL:-}"
 LIVEKIT_JWT_URL="${LIVEKIT_JWT_URL:-}"
 
@@ -84,6 +87,16 @@ if [ -z "$BASE_URL" ]; then
   export MATRIX_BASE_URL="$BASE_URL"
   export LIVEKIT_WS_URL
   export LIVEKIT_JWT_URL
+else
+  # When using NodePort (MATRIX_BASE_URL set), infer LiveKit URLs from same host if not set
+  if [ -z "$LIVEKIT_WS_URL" ] || [ -z "$LIVEKIT_JWT_URL" ]; then
+    BASE_HOST=$(echo "$BASE_URL" | sed -n 's|^[^:]*://\([^:/]*\).*|\1|p')
+    [ -z "$BASE_HOST" ] && BASE_HOST="localhost"
+    [ -z "$LIVEKIT_WS_URL" ] && LIVEKIT_WS_URL="ws://${BASE_HOST}:30049"
+    [ -z "$LIVEKIT_JWT_URL" ] && LIVEKIT_JWT_URL="http://${BASE_HOST}:30050"
+    export LIVEKIT_WS_URL
+    export LIVEKIT_JWT_URL
+  fi
 fi
 
 echo "Running E2E QA..."

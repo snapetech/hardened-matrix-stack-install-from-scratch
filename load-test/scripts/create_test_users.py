@@ -4,6 +4,9 @@ Create N test users via Synapse Admin API and optionally create the private E2EE
 (invite-only; only admin_user_id + these bots). Writes test_users.json (user_id, password, access_token).
 Idempotent: if test_users_file exists and has enough users, skips creation unless --force.
 Respects 429: retries after retry_after_ms (with backoff cap).
+
+Note: The 1c/1g limit is for the k8s test stack only. Run this on a capable host; use
+--delay-between-users 0 or a small value when the server has relaxed rate limits (e.g. QA).
 """
 import argparse
 import json
@@ -66,6 +69,7 @@ def main() -> int:
     parser.add_argument("--participants", type=int, help="Number of test users (overrides config)")
     parser.add_argument("--force", action="store_true", help="Recreate users even if file exists")
     parser.add_argument("--create-room-only", action="store_true", help="Only create room; do not create users")
+    parser.add_argument("--delay-between-users", type=float, default=2.5, help="Seconds to wait between creating each user (0 = max parallel; use smaller with QA relaxed rate limits)")
     args = parser.parse_args()
 
     if not os.path.isfile(args.config):
@@ -100,6 +104,9 @@ def main() -> int:
                 localpart = f"test-load-{i}"
                 user_id = f"@{localpart}:{server_name}"
                 password = secrets.token_urlsafe(24)
+                # Optional stagger (use 0 or small value when server has relaxed rate limits, e.g. QA)
+                if i > 1 and args.delay_between_users > 0:
+                    time.sleep(args.delay_between_users)
                 # Create user via Admin API (retry on 429)
                 r = request_with_429_retry(
                     "PUT",
@@ -159,9 +166,8 @@ def main() -> int:
             bot_user_ids = [u["user_id"] for u in json.load(f).get("users", [])]
     else:
         bot_user_ids = [u["user_id"] for u in users]
+    # Invite only the bot users; the admin is the room creator and is already in the room (inviting them causes 403).
     invite_list = list(bot_user_ids)
-    if admin_user_id and admin_user_id not in invite_list:
-        invite_list.append(admin_user_id)
     r = request_with_429_retry(
         "POST",
         urljoin(server_url, "/_matrix/client/v3/createRoom"),

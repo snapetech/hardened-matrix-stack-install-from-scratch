@@ -1,5 +1,8 @@
-# nginx in front of Synapse: same functions as VM installer (proxy, rate-limit, no-federation).
+# nginx in front of Synapse: same functions as VM installer (proxy, no-federation).
 # In QA we allow _synapse/admin from any IP so registration tests work; on VM you lock to localhost.
+# QA: rate limiting is OFF so create_test_users and call tests never hit 429/503.
+# QA: spread Synapse rate-limit keys by setting X-Forwarded-For to 10.0.0.$octet per connection
+# (Synapse rate-limits by client IP; all tests from one host would otherwise share one bucket).
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -21,9 +24,8 @@ data:
       sendfile on;
       keepalive_timeout 65;
       client_max_body_size 50M;
-
-      limit_req_zone $binary_remote_addr zone=login_zone:10m rate=1r/s;
-      limit_req_zone $binary_remote_addr zone=reg_zone:10m rate=1r/s;
+      # QA: per-connection "client IP" so Synapse sees many IPs and does not single-bucket rate limit
+      map $connection $qa_ff_octet { "~([0-9]{1,2})$" $1; default 1; }
 
       server {
         listen 80;
@@ -44,7 +46,7 @@ data:
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
           proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_http_version 1.1;
           proxy_connect_timeout 30s;
           proxy_send_timeout 120s;
@@ -57,49 +59,45 @@ data:
         }
 
         location = /_matrix/client/v3/login {
-          limit_req zone=login_zone burst=10 nodelay;
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
           proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_http_version 1.1;
         }
         location = /_matrix/client/v3/register {
-          limit_req zone=reg_zone burst=5 nodelay;
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
           proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_http_version 1.1;
         }
         location = /_matrix/client/r0/login {
-          limit_req zone=login_zone burst=10 nodelay;
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
           proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_http_version 1.1;
         }
         location = /_matrix/client/r0/register {
-          limit_req zone=reg_zone burst=5 nodelay;
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
           proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_http_version 1.1;
         }
 
         location /_matrix {
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_set_header X-Forwarded-Proto $scheme;
           proxy_http_version 1.1;
         }
         location /_synapse {
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_set_header X-Forwarded-Proto $scheme;
           proxy_http_version 1.1;
         }

@@ -11,10 +11,10 @@ metadata:
 spec:
   hard:
     pods: "30"
-    requests.cpu: "600m"
-    requests.memory: "650Mi"
-    limits.cpu: "1000m"
-    limits.memory: "950Mi"
+    requests.cpu: "700m"
+    requests.memory: "950Mi"
+    limits.cpu: "1500m"
+    limits.memory: "1600Mi"
 ---
 apiVersion: v1
 kind: LimitRange

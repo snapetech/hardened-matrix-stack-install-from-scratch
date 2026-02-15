@@ -42,7 +42,7 @@ Target requests/limits that fit under the quota:
 | lk-jwt     | 10m     | 50m     | 25Mi    | 50Mi    |
 | **Totals** | **380m**| **1000m**| **555Mi**| **920Mi**|
 
-The existing k8s-qa manifests already set `resources.requests` (and some limits). For a strict 1c/1g test, patch deployments to match the table above, or use a kustomize overlay.
+The k8s-qa manifests (synapse, postgres, nginx, coturn, livekit, lk-jwt) already set these requests/limits by default, so they fit under the quota without patching.
 
 **Profile B (better call quality):** Keep the same memory limits, but omit CPU *limits* for Synapse and LiveKit so they can burst; keep CPU *requests* as above.
 

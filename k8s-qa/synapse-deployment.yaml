@@ -27,6 +27,13 @@ spec:
               value: "qa.local"
             - name: SYNAPSE_REPORT_STATS
               value: "no"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "350m"
           volumeMounts:
             - name: data
               mountPath: /data
@@ -39,6 +46,8 @@ spec:
               sed -i 's/^registration_shared_secret:.*/registration_shared_secret: "qa-test-registration-secret"/' /data/homeserver.yaml || echo 'registration_shared_secret: "qa-test-registration-secret"' >> /data/homeserver.yaml
               grep -q "enable_registration_without_verification" /data/homeserver.yaml || printf '\nenable_registration_without_verification: true\n' >> /data/homeserver.yaml
               mkdir -p /data/conf.d
+              # QA only: relax all client-facing rate limits so create_test_users and ramp never see 429. Live/VM deploy does not use this manifest.
+              { printf '%s\n' "ratelimiting:" "  rc_registration:" "    per_second: 100" "    burst_count: 1000" "  rc_login:" "    address:" "      per_second: 100" "      burst_count: 1000" "    account:" "      per_second: 100" "      burst_count: 1000" "    failed_attempts:" "      per_second: 100" "      burst_count: 1000" "  rc_message:" "    per_second: 100" "    burst_count: 1000" "  rc_joins:" "    per_second: 100" "    burst_count: 1000" "  rc_delayed_event_mgmt:" "    per_second: 100" "    burst_count: 1000"; } > /data/conf.d/98-ratelimit-qa.yaml
               printf 'enable_metrics: true\nlisteners:\n  - port: 8008\n    tls: false\n    type: http\n    x_forwarded: true\n    bind_addresses: ["0.0.0.0"]\n    resources:\n      - names: [client, federation, metrics]\n        compress: false\n' > /data/conf.d/99-metrics.yaml
               chown -R 991:991 /data
           volumeMounts:
@@ -107,8 +116,11 @@ spec:
             periodSeconds: 5
           resources:
             requests:
-              memory: "256Mi"
-              cpu: "100m"
+              memory: "240Mi"
+              cpu: "150m"
+            limits:
+              memory: "380Mi"
+              cpu: "350m"
       volumes:
         - name: data
           emptyDir: {}

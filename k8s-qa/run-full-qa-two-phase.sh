@@ -44,6 +44,7 @@ fi
 # deploy-and-test.sh exits and kills port-forward. So we need to start port-forward again for Phase 2
 # unless MATRIX_BASE_URL is set (user provided NodePort URL).
 BASE_URL="${MATRIX_BASE_URL:-}"
+BASE_URL="${BASE_URL%/}"
 if [ -z "$BASE_URL" ]; then
   echo ""
   echo "Starting port-forward for Phase 2..."
@@ -58,6 +59,14 @@ if [ -z "$BASE_URL" ]; then
   kubectl port-forward -n "$NS" svc/livekit 30049:7880 &
   kubectl port-forward -n "$NS" svc/lk-jwt 30050:6080 &
   sleep 2
+else
+  # NodePort: infer LiveKit URLs from same host if not set (so Phase 2 call tests can run)
+  if [ -z "${LIVEKIT_WS_URL:-}" ] || [ -z "${LIVEKIT_JWT_URL:-}" ]; then
+    BASE_HOST=$(echo "$BASE_URL" | sed -n 's|^[^:]*://\([^:/]*\).*|\1|p')
+    [ -z "$BASE_HOST" ] && BASE_HOST="localhost"
+    [ -z "${LIVEKIT_WS_URL:-}" ] && export LIVEKIT_WS_URL="ws://${BASE_HOST}:30049"
+    [ -z "${LIVEKIT_JWT_URL:-}" ] && export LIVEKIT_JWT_URL="http://${BASE_HOST}:30050"
+  fi
 fi
 
 # ---------- Phase 2: Enable federation, run federation + blocklist tests ----------

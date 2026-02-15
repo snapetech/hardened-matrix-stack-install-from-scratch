@@ -1,7 +1,7 @@
 # Optional: use this ConfigMap when testing federation. Allows /_matrix/federation and serves .well-known/matrix/server.
 # Apply and restart nginx: kubectl apply -f k8s-qa/nginx-configmap-federation.yaml && kubectl rollout restart deployment/nginx -n matrix-qa
-# Set FEDERATION_SERVER_URL when using: e.g. https://matrix-qa.example.com (must be reachable by remote servers).
-# Default below uses $host so when accessed via NodePort/port-forward the request host is used.
+# QA: rate limiting is OFF (same as no-federation config).
+# QA: spread Synapse rate-limit keys via X-Forwarded-For 10.0.0.$octet per connection.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -23,9 +23,7 @@ data:
       sendfile on;
       keepalive_timeout 65;
       client_max_body_size 50M;
-
-      limit_req_zone $binary_remote_addr zone=login_zone:10m rate=1r/s;
-      limit_req_zone $binary_remote_addr zone=reg_zone:10m rate=1r/s;
+      map $connection $qa_ff_octet { "~([0-9]{1,2})$" $1; default 1; }
 
       server {
         listen 80;
@@ -48,7 +46,7 @@ data:
         location /_matrix/federation {
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_set_header X-Forwarded-Proto $scheme;
           proxy_http_version 1.1;
         }
@@ -57,7 +55,7 @@ data:
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
           proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_http_version 1.1;
           proxy_connect_timeout 30s;
           proxy_send_timeout 120s;
@@ -70,49 +68,45 @@ data:
         }
 
         location = /_matrix/client/v3/login {
-          limit_req zone=login_zone burst=10 nodelay;
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
           proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_http_version 1.1;
         }
         location = /_matrix/client/v3/register {
-          limit_req zone=reg_zone burst=5 nodelay;
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
           proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_http_version 1.1;
         }
         location = /_matrix/client/r0/login {
-          limit_req zone=login_zone burst=10 nodelay;
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
           proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_http_version 1.1;
         }
         location = /_matrix/client/r0/register {
-          limit_req zone=reg_zone burst=5 nodelay;
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
           proxy_set_header X-Forwarded-Proto $scheme;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_http_version 1.1;
         }
 
         location /_matrix {
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_set_header X-Forwarded-Proto $scheme;
           proxy_http_version 1.1;
         }
         location /_synapse {
           proxy_pass http://synapse:8008;
           proxy_set_header Host $host;
-          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-For "10.0.0.$qa_ff_octet";
           proxy_set_header X-Forwarded-Proto $scheme;
           proxy_http_version 1.1;
         }
