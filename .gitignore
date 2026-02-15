@@ -2,7 +2,15 @@
 load-test/.env
 load-test/config.yaml
 load-test/test_users.json
+load-test/test_users_qa_e2e.json
+load-test/config-qa-e2e.yaml
 load-test/.safety_triggered
 load-test/*.txt
 load-test/scripts/__pycache__/
 load-test/.venv/
+
+# k8s-qa: never commit app passwords or alert email
+k8s-qa/.env
+k8s-qa/secrets.env
+k8s-qa/*.secret.yaml
+k8s-qa/local-*.yaml

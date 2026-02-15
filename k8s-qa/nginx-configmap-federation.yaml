@@ -1,0 +1,124 @@
+# Optional: use this ConfigMap when testing federation. Allows /_matrix/federation and serves .well-known/matrix/server.
+# Apply and restart nginx: kubectl apply -f k8s-qa/nginx-configmap-federation.yaml && kubectl rollout restart deployment/nginx -n matrix-qa
+# Set FEDERATION_SERVER_URL when using: e.g. https://matrix-qa.example.com (must be reachable by remote servers).
+# Default below uses $host so when accessed via NodePort/port-forward the request host is used.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: matrix-qa
+data:
+  nginx.conf: |
+    user nginx;
+    worker_processes auto;
+    error_log /var/log/nginx/error.log warn;
+    pid /tmp/nginx.pid;
+    events { worker_connections 1024; }
+    http {
+      include /etc/nginx/mime.types;
+      default_type application/octet-stream;
+      log_format main '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"';
+      access_log /var/log/nginx/access.log main;
+      sendfile on;
+      keepalive_timeout 65;
+      client_max_body_size 50M;
+
+      limit_req_zone $binary_remote_addr zone=login_zone:10m rate=1r/s;
+      limit_req_zone $binary_remote_addr zone=reg_zone:10m rate=1r/s;
+
+      server {
+        listen 80;
+        server_name _;
+
+        location /.well-known/matrix/client {
+          default_type application/json;
+          add_header Access-Control-Allow-Origin * always;
+          add_header Access-Control-Allow-Methods "GET, OPTIONS" always;
+          add_header Access-Control-Allow-Headers "Origin, X-Requested-With, Content-Type, Accept, Authorization" always;
+          return 200 '{"m.homeserver":{"base_url":"http://$host/"}}';
+        }
+
+        location = /.well-known/matrix/server {
+          default_type application/json;
+          add_header Access-Control-Allow-Origin * always;
+          return 200 "{\"m.server\":\"$host:80\"}";
+        }
+
+        location /_matrix/federation {
+          proxy_pass http://synapse:8008;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_http_version 1.1;
+        }
+
+        location ~ ^/_synapse/admin {
+          proxy_pass http://synapse:8008;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_http_version 1.1;
+          proxy_connect_timeout 30s;
+          proxy_send_timeout 120s;
+          proxy_read_timeout 120s;
+        }
+        location = /_synapse/metrics {
+          allow all;
+          proxy_pass http://synapse:8008;
+          proxy_set_header Host $host;
+        }
+
+        location = /_matrix/client/v3/login {
+          limit_req zone=login_zone burst=10 nodelay;
+          proxy_pass http://synapse:8008;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_http_version 1.1;
+        }
+        location = /_matrix/client/v3/register {
+          limit_req zone=reg_zone burst=5 nodelay;
+          proxy_pass http://synapse:8008;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_http_version 1.1;
+        }
+        location = /_matrix/client/r0/login {
+          limit_req zone=login_zone burst=10 nodelay;
+          proxy_pass http://synapse:8008;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_http_version 1.1;
+        }
+        location = /_matrix/client/r0/register {
+          limit_req zone=reg_zone burst=5 nodelay;
+          proxy_pass http://synapse:8008;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_http_version 1.1;
+        }
+
+        location /_matrix {
+          proxy_pass http://synapse:8008;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_http_version 1.1;
+        }
+        location /_synapse {
+          proxy_pass http://synapse:8008;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_http_version 1.1;
+        }
+        location / {
+          return 200 'OK';
+          add_header Content-Type text/plain;
+        }
+      }
+    }

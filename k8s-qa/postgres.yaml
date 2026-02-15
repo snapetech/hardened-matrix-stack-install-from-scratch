@@ -1,0 +1,66 @@
+# PostgreSQL for Synapse (optional; use with full k8s-qa stack).
+# Apply before or with synapse-deployment; Synapse init will use DB when this exists.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres
+  namespace: matrix-qa
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: "qa-synapse-db-secret"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: matrix-qa
+spec:
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+  selector:
+    app: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: matrix-qa
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          env:
+            - name: POSTGRES_USER
+              value: synapse
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: synapse
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "synapse"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: data
+          emptyDir: {}  # use pvc in production

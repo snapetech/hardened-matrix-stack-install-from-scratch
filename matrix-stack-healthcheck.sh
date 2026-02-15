@@ -6,6 +6,7 @@
 #   --allow-reboot if critical (nginx/synapse) still down after 3 runs, create reboot marker;
 #                  next run with --allow-reboot performs reboot in 60s. Or touch $STATE_DIR/request-reboot to request reboot.
 #   --clear-fail2ban  unban all currently banned IPs in all fail2ban jails, then exit (no other checks).
+# Element Call (docker compose in /opt/element-call) is checked if present; create $STATE_DIR/skip-element-call to skip.
 # Used by: Monit (--check-only) and systemd timer (periodic run with restarts).
 set -euo pipefail
 
@@ -99,8 +100,8 @@ if command -v docker &>/dev/null; then
       docker restart "$name" 2>/dev/null && LOG "docker $name: restarted OK" || { LOG "docker $name: restart failed"; FAILED_ANY=true; }
     fi
   done
-  # Element Call: docker compose in /opt/element-call
-  if [ -d /opt/element-call ] && [ -f /opt/element-call/docker-compose.yml ]; then
+  # Element Call: docker compose in /opt/element-call (skip if opt-out file present)
+  if [ -d /opt/element-call ] && [ -f /opt/element-call/docker-compose.yml ] && [ ! -f "$STATE_DIR/skip-element-call" ]; then
     (
       cd /opt/element-call
       up=$(docker compose ps -q 2>/dev/null || docker-compose ps -q 2>/dev/null)

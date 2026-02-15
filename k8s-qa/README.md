@@ -1,6 +1,6 @@
 # Testing in Kubernetes
 
-Minimal Synapse deployment for QA: run the Matrix stack test suite against a Synapse instance in any Kubernetes cluster (k3s, kind, minikube, EKS, etc.).
+Minimal or full Matrix stack in Kubernetes for QA: Synapse (SQLite or Postgres), optional LiveKit + lk-jwt for Element Call, and a comprehensive headless test suite.
 
 **Run everything from this repo’s root.** Clone the repo if needed, then `cd` into `hardened-matrix-stack-install-from-scratch` so that `./k8s-qa/run-matrix-qa-tests.sh` and `kubectl apply -f k8s-qa/` use the files in this directory.
 
@@ -19,39 +19,72 @@ Minimal Synapse deployment for QA: run the Matrix stack test suite against a Syn
 
 ## What’s in k8s-qa
 
-- **namespace.yaml** — `matrix-qa` namespace.
-- **synapse-deployment.yaml** — One Synapse pod (init containers generate config + signing keys and set a known `registration_shared_secret`), Service (NodePort 30048), and Secret.
-- **run-matrix-qa-tests.sh** — Test script: client versions, register (Admin API shared secret), create room, send message, logout.
-- **port-forward-and-test.sh** — Port-forward Synapse to localhost:30048, run the test script, then stop the forward (for use when not on the cluster node).
+| File | Purpose |
+|------|---------|
+| **namespace.yaml** | `matrix-qa` namespace |
+| **synapse-deployment.yaml** | Synapse pod (init: generate + config + optional Postgres), Service ClusterIP (backend only). |
+| **nginx-configmap.yaml** + **nginx.yaml** | nginx reverse proxy: proxy to Synapse, rate-limit login/register, no-federation. Single entrypoint NodePort 30048. |
+| **postgres.yaml** | Optional PostgreSQL for Synapse (Deployment + Service + Secret). Synapse uses it when this is applied. |
+| **coturn.yaml** | Optional Coturn (TURN/STUN); Synapse gets turn.yaml when this is applied. coturn-test-job verifies port 3478. |
+| **livekit.yaml** | Optional LiveKit server + lk-jwt-service for Element Call / MatrixRTC. NodePorts 30049 (WS), 30050 (JWT). |
+| **run-matrix-qa-tests.sh** | API tests: versions, nginx (federation block, .well-known, rate limit), metrics, whoami, sync, timeline, register/login, rooms, file upload/download, logout |
+| **run-e2e-qa.sh** | Full E2E: runs API tests, then (if LiveKit URLs set) headless call tests (3–5 participants, video+audio) |
+| **port-forward-and-test.sh** | Port-forward nginx to localhost:30048, run API tests, then stop forward |
+| **deploy-and-test.sh** | Deploy all manifests, wait for Ready, then run E2E (with port-forward if no BASE_URL). If Secret `msmtp-credentials` exists, runs optional email test. |
+| **send-test-email.sh** | Optional: send one test email from the cluster (verifies msmtp/alert path; same path fail2ban uses on VM). Requires Secret; see below. |
+| **send-test-email-job.yaml** + **send-test-email-configmap.yaml** | Job + script to send one email via Gmail SMTP. No secrets in repo. |
+| **moderation-bots-setup-job.yaml** | One-time Job: create admin (if missing), @draupnir/@mjolnir, management rooms; outputs tokens for Secrets. |
+| **create-moderation-secrets-from-job.sh** | After setup Job completes, parses log and creates Secrets draupnir-config, mjolnir-config. |
+| **draupnir.yaml** + **mjolnir.yaml** | Draupnir and Mjolnir Deployments (config from Secrets). |
+| **ensure-moderation-bots-configmap.yaml** + **ensure-moderation-bots-cronjob.yaml** | Script + CronJob: add bots to all rooms and make them room admins (every 10 min). |
+| **ensure-moderation-bots-in-rooms.sh** | Standalone script (same logic as CronJob); for VM or one-off run. |
+| **nginx-configmap-federation.yaml** | Optional: nginx config with federation allowed and .well-known/matrix/server for federation tests. |
+| **TEST-MATRIX.md** | Full test matrix: every feature and workflow (auth, rooms, E2EE, file share, voice/video calls, moderation bots, optional email) |
 
 ## Deploy
 
-From the repo root, with `kubectl` and `KUBECONFIG` (or default `~/.kube/config`) pointing at your cluster:
+From the repo root, with `kubectl` and `KUBECONFIG` pointing at your cluster:
 
 ```bash
+# Full stack (Synapse + Postgres + LiveKit + lk-jwt)
 kubectl apply -f k8s-qa/
 ```
 
-Wait until the pod is running and ready:
+If you apply the whole directory, `send-test-email-configmap.yaml` and `send-test-email-job.yaml` are included; the Job runs once. Without the `msmtp-credentials` Secret it will fail (safe to ignore or delete the job). To deploy without the email Job, apply only: `namespace.yaml`, `postgres.yaml`, `synapse-deployment.yaml`, `nginx-configmap.yaml`, `nginx.yaml`, `coturn.yaml`, `livekit.yaml`. `deploy-and-test.sh` applies that set.
+
+- **Moderation bots (Draupnir + Mjolnir):** Create Secret `matrix-qa-admin` with key `admin-password`, then run `deploy-and-test.sh` (or apply moderation-bots-setup-job, wait for completion, run `create-moderation-secrets-from-job.sh`, then apply draupnir.yaml, mjolnir.yaml, ensure-moderation-bots-configmap, ensure-moderation-bots-cronjob). Bots are added to all rooms and made room admins by the CronJob. To run the moderation-bots test: `MODERATION_BOTS_TEST=1 MATRIX_QA_ADMIN_PASSWORD=<admin-pass> ./k8s-qa/run-matrix-qa-tests.sh`.
+- **Federation (optional):** Apply `nginx-configmap-federation.yaml` and restart nginx to allow `/_matrix/federation` and serve `/.well-known/matrix/server`. **When federating, subscribe Draupnir/Mjolnir to at least one community policy list** (see repo `COMMUNITY-POLICY-LISTS.md`). Default list: `#community-moderation-effort-bl:neko.dev` (CME). In management room: `!draupnir watch #community-moderation-effort-bl:neko.dev` or use `subscribe-draupnir-community-lists.sh`. Test 30 sends the watch command and asserts success.
+- **Minimal (Synapse + nginx):** Apply `namespace.yaml`, `synapse-deployment.yaml`, `nginx-configmap.yaml`, `nginx.yaml`. All client traffic goes through nginx (NodePort 30048) so we QA proxy, rate-limit, and no-federation.
+- **With Postgres:** Also apply `postgres.yaml`. Synapse init will detect the postgres Secret and use PostgreSQL.
+- **With LiveKit (calls):** Also apply `livekit.yaml`. Expose NodePorts 30049 (LiveKit WS) and 30050 (lk-jwt).
+
+Wait until pods are ready:
 
 ```bash
 kubectl get pods -n matrix-qa -w
 ```
 
-First run can take 1–2 minutes (init generates config and signing keys). When `READY` is `1/1`, Synapse is up.
+First run can take 1–2 minutes (init generates config and signing keys; Postgres must be up before Synapse if used).
 
 ## Access
 
-- **NodePort (on the node or same network):** `http://<node-ip>:30048`.
+- **NodePort (on the node or same network):**  
+  Matrix (via nginx): `http://<node-ip>:30048`  
+  LiveKit WS: `ws://<node-ip>:30049`  
+  lk-jwt: `http://<node-ip>:30050`
 - **Port-forward (from any machine with kubectl):**
   ```bash
-  kubectl port-forward -n matrix-qa svc/synapse 30048:8008
+  kubectl port-forward -n matrix-qa svc/nginx 30048:80
+  kubectl port-forward -n matrix-qa svc/livekit 30049:7880
+  kubectl port-forward -n matrix-qa svc/lk-jwt 30050:6080
   ```
-  Then use `http://localhost:30048`.
+  Then use `http://localhost:30048`, `ws://localhost:30049`, `http://localhost:30050`. All Matrix API traffic goes through nginx (proxy, rate-limit, no-federation).
 
 ## Run tests
 
-Requires: `curl`, `jq`, `openssl`.
+Requires: `curl`, `jq`, `openssl`. For call tests: Python 3.10+ and `load-test/requirements.txt`.
+
+### API + multi-user + file tests (no LiveKit)
 
 From the repo root:
 
@@ -59,21 +92,66 @@ From the repo root:
 # If you’re on the node or already port-forwarding to 30048:
 ./k8s-qa/run-matrix-qa-tests.sh
 
-# From another machine: port-forward and run tests in one go
+# Port-forward and run in one go
 ./k8s-qa/port-forward-and-test.sh
 
-# Custom URL (e.g. different port or host):
+# Custom URL
 MATRIX_BASE_URL=http://localhost:9000 ./k8s-qa/run-matrix-qa-tests.sh
-./k8s-qa/run-matrix-qa-tests.sh http://192.168.1.10:30048
 ```
 
-If you overrode `registration_shared_secret` in the cluster, set it when running tests:
+### Full E2E (API + call tests)
+
+Set LiveKit URLs so call tests run (headless 3–5 participants, video+audio):
+
+```bash
+# With port-forward (default)
+./k8s-qa/deploy-and-test.sh
+
+# Or manually: port-forward, then
+MATRIX_BASE_URL=http://localhost:30048 \
+LIVEKIT_WS_URL=ws://localhost:30049 \
+LIVEKIT_JWT_URL=http://localhost:30050 \
+MATRIX_QA_SERVER_NAME=qa.local \
+./k8s-qa/run-e2e-qa.sh
+
+# With NodePort (replace <node-ip>)
+MATRIX_BASE_URL=http://<node-ip>:30048 \
+LIVEKIT_WS_URL=ws://<node-ip>:30049 \
+LIVEKIT_JWT_URL=http://<node-ip>:30050 \
+./k8s-qa/run-e2e-qa.sh
+```
+
+If you overrode `registration_shared_secret` in the cluster:
 
 ```bash
 MATRIX_REGISTRATION_SHARED_SECRET=your-secret ./k8s-qa/run-matrix-qa-tests.sh
 ```
 
 Exit code 0 = all tests passed.
+
+## Optional: fail2ban / msmtp email in the workflow
+
+**Credentials are never stored in the repo.** Use a Kubernetes Secret (or env only in CI) so the app password never leaks.
+
+- **In k8s:** The same “alert email” path (Gmail + app password) that fail2ban and Monit use on the VM can be verified from the cluster by sending one test email. Create the Secret once (do not commit it):
+
+  ```bash
+  kubectl create secret generic msmtp-credentials -n matrix-qa \
+    --from-literal=password=YOUR_GMAIL_APP_PASSWORD \
+    --from-literal=alert_email=your@gmail.com
+  ```
+
+  Then run `./k8s-qa/send-test-email.sh`, or let `./k8s-qa/deploy-and-test.sh` run it automatically after E2E if the secret exists. The Job sends one “k8s-qa email test” message; check your inbox.
+
+- **Fail2ban triggering:** fail2ban (sshd, matrix-synapse-auth) runs on the **VM** (e.g. after `run-qa-noninteractive.sh` and `setup-email-alerts.sh`). When a ban fires there, fail2ban uses the same msmtp/sendmail path to email you. In k8s we don’t run fail2ban; we only verify that the **email path** works by sending one test email from a Job when you provide credentials via the Secret. So: **k8s QA = “email can be sent”; VM = full fail2ban + email on ban.**
+
+- **Safe use in CI:** In a pipeline, set the app password in a secret/store (e.g. CI secret variable) and create the Secret from env before running deploy-and-test, e.g. `kubectl create secret generic msmtp-credentials -n matrix-qa --from-literal=password="$MSMTP_APP_PASSWORD" --from-literal=alert_email="$ALERT_EMAIL"`. Never log or commit `MSMTP_APP_PASSWORD`.
+
+## Test matrix
+
+See **[TEST-MATRIX.md](TEST-MATRIX.md)** for the full list of test cases: discovery, auth, rooms (encrypted and unencrypted), multi-user messaging, file upload/download, voice/video calls, moderation bots (in-room + admin PL), and community-list subscription (send `!draupnir watch` to management room). All run headless in k8s or on a VM.
+
+**Live integration (VM installer):** The same workflow is used in the repo’s VM installer: when federation is enabled, a moderation bot (Draupnir or Mjolnir) is required; the installer subscribes it to the CME community list. Ensure-bots-in-rooms cron and community list scripts are in the repo root: `ensure-moderation-bots-in-rooms.sh`, `subscribe-draupnir-community-lists.sh`, `subscribe-mjolnir-community-lists.sh`, and [COMMUNITY-POLICY-LISTS.md](../COMMUNITY-POLICY-LISTS.md).
 
 ## Teardown
 

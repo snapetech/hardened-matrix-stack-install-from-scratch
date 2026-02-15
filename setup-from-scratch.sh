@@ -175,6 +175,10 @@ run_prompts() {
     if [ -n "${INSTALL_MJOLNIR:-}" ]; then
       case "$(echo "${INSTALL_MJOLNIR}" | tr '[:upper:]' '[:lower:]')" in y|yes|1|true) INSTALL_MODERATION_BOT=mjolnir ;; *) INSTALL_MODERATION_BOT=none ;; esac
     fi
+    # When federation is on, require a moderation bot (default draupnir) so we can subscribe to community lists.
+    if [ "$FEDERATION" = "y" ] && [ "$INSTALL_MODERATION_BOT" = "none" ]; then
+      INSTALL_MODERATION_BOT=draupnir
+    fi
     [ "$MONITORING_BACKEND" = "none" ] && INSTALL_METRICS_AUTH="n"
     ADMIN_USER="${ADMIN_USER:-admin}"
     echo "  (NON_INTERACTIVE=1: using MATRIX_DOMAIN=$MATRIX_DOMAIN SERVER_NAME=$SERVER_NAME MONITORING=$MONITORING_BACKEND MODERATION_BOT=$INSTALL_MODERATION_BOT)"
@@ -186,6 +190,17 @@ run_prompts() {
     prompt ROOT_DOMAIN "$SERVER_NAME" "Root domain for .well-known discovery (usually same as server name):"
     prompt LE_EMAIL "admin@$SERVER_NAME" "Email for Let's Encrypt (cert expiry notices):"
     yesno FEDERATION "n" "Enable federation (open to other Matrix servers)?"
+    # When federation is enabled, a moderation bot with a subscribed community list is required (no loop: we enable federation first, then subscribe to remote lists).
+    if [ "$FEDERATION" = "y" ]; then
+      echo "  Federation requires a moderation bot and subscribing to at least one community policy list (e.g. CME)."
+      read -p "Moderation bot: (d)raupnir / (m)jolnir [draupnir]: " mod_choice
+      mod_choice="${mod_choice:-draupnir}"
+      case "$(echo "$mod_choice" | tr '[:upper:]' '[:lower:]')" in
+        d|draupnir) INSTALL_MODERATION_BOT=draupnir ;;
+        m|mj|mjolnir) INSTALL_MODERATION_BOT=mjolnir ;;
+        *) INSTALL_MODERATION_BOT=draupnir ;;
+      esac
+    fi
     yesno INSTALL_COTURN "y" "Install coturn (TURN/STUN for voice/video)?"
     # Monitoring: exactly one of none, netdata, prometheus
     read -p "Monitoring backend: (n)one / (net)data / (prom)etheus [netdata]: " mon_choice
@@ -199,14 +214,16 @@ run_prompts() {
     yesno INSTALL_FAIL2BAN "y" "Install fail2ban (login brute-force protection)?"
     yesno INSTALL_BACKUP_CRON "y" "Install backup script and daily cron?"
     yesno INSTALL_EMAIL_ALERTS "n" "Set up email alerts (msmtp, fail2ban mail, Monit, daily digest)? (Gmail: need App Password — see https://myaccount.google.com/apppasswords)"
-    # Moderation bot: exactly one of none, draupnir, mjolnir
-    read -p "Moderation bot: (n)one / (d)raupnir / (m)jolnir [none]: " mod_choice
-    mod_choice="${mod_choice:-none}"
-    case "$(echo "$mod_choice" | tr '[:upper:]' '[:lower:]')" in
-      d|draupnir) INSTALL_MODERATION_BOT=draupnir ;;
-      m|mj|mjolnir) INSTALL_MODERATION_BOT=mjolnir ;;
-      *) INSTALL_MODERATION_BOT=none ;;
-    esac
+    # Moderation bot: exactly one of none, draupnir, mjolnir (if federation already forced draupnir/mjolnir, skip)
+    if [ "$FEDERATION" != "y" ]; then
+      read -p "Moderation bot: (n)one / (d)raupnir / (m)jolnir [none]: " mod_choice
+      mod_choice="${mod_choice:-none}"
+      case "$(echo "$mod_choice" | tr '[:upper:]' '[:lower:]')" in
+        d|draupnir) INSTALL_MODERATION_BOT=draupnir ;;
+        m|mj|mjolnir) INSTALL_MODERATION_BOT=mjolnir ;;
+        *) INSTALL_MODERATION_BOT=none ;;
+      esac
+    fi
     yesno INSTALL_MAUBOT "n" "Install Maubot (plugin bot)?"
     yesno INSTALL_DISCORD "n" "Install Discord bridge (appservice)?"
     if [ "$MONITORING_BACKEND" != "none" ]; then
@@ -1058,6 +1075,19 @@ EOF
     -v /opt/draupnir/data:/data/storage \
     gnuxie/draupnir:latest bot --draupnir-config /data/config/production.yaml
   echo "  Draupnir running (Docker container draupnir). Management room: $ROOM_ID (invited @$DRAP_ADMIN:$SERVER_NAME)."
+  # Cron: ensure Draupnir (and Mjolnir if present) in all rooms as room admins
+  command -v jq &>/dev/null || (apt-get update -qq && apt-get install -y -qq jq)
+  ENV_FILE="$REPO_DIR/.ensure-moderation-bots-env"
+  printf 'ADMIN_PASSWORD=%s\nSYNAPSE_BASE_URL=https://%s\nMATRIX_SERVER_NAME=%s\n' "${ADMIN_PASSWORD:-$MATRIX_PASSWORD}" "$MATRIX_DOMAIN" "$SERVER_NAME" > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  CRON_CMD=". $ENV_FILE 2>/dev/null; [ -n \"\$ADMIN_PASSWORD\" ] && export SYNAPSE_BASE_URL MATRIX_SERVER_NAME ADMIN_PASSWORD && $REPO_DIR/k8s-qa/ensure-moderation-bots-in-rooms.sh"
+  (crontab -l 2>/dev/null | grep -v "ensure-moderation-bots-in-rooms"; echo "*/10 * * * * $CRON_CMD") | crontab - 2>/dev/null || true
+  echo "  Cron: ensure-moderation-bots every 10 min (adds bots to all rooms as admins)."
+  # When federation is on, subscribe to at least one community list (mandatory before considering server federated).
+  if [ "$FEDERATION" = "y" ] && [ -f "$REPO_DIR/subscribe-draupnir-community-lists.sh" ]; then
+    echo "  Subscribing Draupnir to community policy list (CME)..."
+    BASE="$BASE" MANAGEMENT_ROOM_ID="$ROOM_ID" ADMIN_ACCESS_TOKEN="$ADMIN_TOKEN" bash "$REPO_DIR/subscribe-draupnir-community-lists.sh" 2>/dev/null || echo "  (Subscribe failed or rate-limited; run manually in management room: !draupnir watch #community-moderation-effort-bl:neko.dev)"
+  fi
 }
 
 setup_mjolnir() {
@@ -1134,6 +1164,19 @@ EOF
     matrixdotorg/mjolnir:latest \
     /usr/bin/node lib/index.js -c /config/production.yaml
   echo "  Mjolnir running (Docker container mjolnir). Management room: $ROOM_ID (invited @$MJOLNIR_ADMIN:$SERVER_NAME)."
+  # Cron: ensure Draupnir/Mjolnir in all rooms as room admins (same as Draupnir path)
+  command -v jq &>/dev/null || (apt-get update -qq && apt-get install -y -qq jq)
+  ENV_FILE="$REPO_DIR/.ensure-moderation-bots-env"
+  printf 'ADMIN_PASSWORD=%s\nSYNAPSE_BASE_URL=https://%s\nMATRIX_SERVER_NAME=%s\n' "$ADMIN_PASSWORD" "$MATRIX_DOMAIN" "$SERVER_NAME" > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  CRON_CMD=". $ENV_FILE 2>/dev/null; [ -n \"\$ADMIN_PASSWORD\" ] && export SYNAPSE_BASE_URL MATRIX_SERVER_NAME ADMIN_PASSWORD && $REPO_DIR/k8s-qa/ensure-moderation-bots-in-rooms.sh"
+  (crontab -l 2>/dev/null | grep -v "ensure-moderation-bots-in-rooms"; echo "*/10 * * * * $CRON_CMD") | crontab - 2>/dev/null || true
+  echo "  Cron: ensure-moderation-bots every 10 min (adds bots to all rooms as admins)."
+  # When federation is on, subscribe to at least one community list.
+  if [ "$FEDERATION" = "y" ] && [ -f "$REPO_DIR/subscribe-mjolnir-community-lists.sh" ]; then
+    echo "  Subscribing Mjolnir to community policy list (CME)..."
+    BASE="https://$MATRIX_DOMAIN" MANAGEMENT_ROOM_ID="$ROOM_ID" ADMIN_ACCESS_TOKEN="$ADMIN_TOKEN" bash "$REPO_DIR/subscribe-mjolnir-community-lists.sh" 2>/dev/null || echo "  (Subscribe failed; run in management room: !mjolnir watch #community-moderation-effort-bl:neko.dev)"
+  fi
 }
 
 # ========== Phase 13: Maubot (plugin bot) ==========

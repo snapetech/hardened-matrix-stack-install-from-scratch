@@ -1,0 +1,46 @@
+# Optional: send one test email from the cluster (e.g. to verify msmtp/fail2ban email path).
+# Credentials are NOT in this file. Create the Secret once (never commit it):
+#
+#   kubectl create secret generic msmtp-credentials -n matrix-qa \
+#     --from-literal=password=YOUR_GMAIL_APP_PASSWORD \
+#     --from-literal=alert_email=your@gmail.com
+#
+# Then: ./k8s-qa/send-test-email.sh   or let deploy-and-test.sh run it if the secret exists.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: send-test-email
+  namespace: matrix-qa
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: send-email
+          image: python:3.11-alpine
+          command: ["python", "/scripts/send_one_email.py"]
+          env:
+            - name: ALERT_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: msmtp-credentials
+                  key: alert_email
+                  optional: true
+            - name: SMTP_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: msmtp-credentials
+                  key: password
+                  optional: true
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: send-test-email-script
+            defaultMode: 0o555

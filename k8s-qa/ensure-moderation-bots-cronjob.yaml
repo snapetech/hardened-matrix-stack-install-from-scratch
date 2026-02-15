@@ -1,0 +1,48 @@
+# CronJob: ensure @draupnir and @mjolnir are in every room and are room admins.
+# Runs every 10 minutes. Requires: ensure-moderation-bots-configmap.yaml, matrix-qa-admin Secret (admin-password).
+# Optional: run once: kubectl create job --from=cronjob/ensure-moderation-bots ensure-moderation-bots-manual -n matrix-qa
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ensure-moderation-bots
+  namespace: matrix-qa
+spec:
+  schedule: "*/10 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 3600
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: ensure
+              image: curlimages/curl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  apk add --no-cache jq
+                  SYNAPSE_BASE_URL="${SYNAPSE_BASE_URL:-http://synapse:8008}" MATRIX_SERVER_NAME="${MATRIX_SERVER_NAME:-qa.local}" ADMIN_PASSWORD="$ADMIN_PASSWORD" sh /script/ensure-moderation-bots-in-rooms.sh
+              env:
+                - name: SYNAPSE_BASE_URL
+                  value: "http://synapse:8008"
+                - name: MATRIX_SERVER_NAME
+                  value: "qa.local"
+                - name: ADMIN_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: matrix-qa-admin
+                      key: admin-password
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: ensure-moderation-bots-script
+                defaultMode: 0555

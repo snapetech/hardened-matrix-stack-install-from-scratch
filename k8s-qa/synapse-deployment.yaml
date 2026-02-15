@@ -1,5 +1,6 @@
 # Synapse QA: minimal instance for testing the Matrix client API in Kubernetes.
 # Init generates config+keys; main runs Synapse. No TLS (use NodePort or port-forward).
+# With postgres.yaml applied, Synapse uses PostgreSQL; otherwise SQLite.
 # Apply: kubectl apply -f k8s-qa/
 ---
 apiVersion: apps/v1
@@ -41,6 +42,47 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+        - name: configure-database
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              mkdir -p /data/conf.d
+              if [ -n "$SYNAPSE_DB_PASSWORD" ]; then
+                printf 'database:\n  name: psycopg2\n  args:\n    database: synapse\n    user: synapse\n    host: postgres\n    port: 5432\n    password: %s\n    cp_min: 2\n    cp_max: 10\n' "$SYNAPSE_DB_PASSWORD" > /data/conf.d/database.yaml
+                chown 991:991 /data/conf.d/database.yaml
+              fi
+          env:
+            - name: SYNAPSE_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: POSTGRES_PASSWORD
+                  optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
+        - name: configure-turn
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              if [ -n "$TURN_SHARED_SECRET" ]; then
+                printf 'turn_uris:\n  - "turn:coturn:3478?transport=udp"\n  - "turn:coturn:3478?transport=tcp"\nturn_shared_secret: "%s"\nturn_user_lifetime: 86400000\nturn_allow_guests: false\n' "$TURN_SHARED_SECRET" > /data/conf.d/turn.yaml
+                chown 991:991 /data/conf.d/turn.yaml
+              fi
+          env:
+            - name: TURN_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: coturn
+                  key: turn_shared_secret
+                  optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
       containers:
         - name: synapse
           image: matrixdotorg/synapse:v1.107.0
@@ -55,7 +97,7 @@ spec:
             httpGet:
               path: /_matrix/client/versions
               port: 8008
-            initialDelaySeconds: 10
+            initialDelaySeconds: 15
             periodSeconds: 5
           resources:
             requests:
@@ -65,19 +107,19 @@ spec:
         - name: data
           emptyDir: {}
 ---
+# ClusterIP only; all client traffic goes through nginx (NodePort 30048).
 apiVersion: v1
 kind: Service
 metadata:
   name: synapse
   namespace: matrix-qa
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: synapse
   ports:
     - port: 8008
       targetPort: 8008
-      nodePort: 30048
       name: http
 ---
 apiVersion: v1

@@ -13,7 +13,7 @@ if ! kubectl get ns matrix-qa &>/dev/null; then
   exit 1
 fi
 
-kubectl port-forward -n matrix-qa svc/synapse 30048:8008 &
+kubectl port-forward -n matrix-qa svc/nginx 30048:80 &
 PF_PID=$!
 trap 'kill $PF_PID 2>/dev/null' EXIT
 sleep 2

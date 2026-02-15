@@ -4,6 +4,8 @@
 
 We use **bot mode** (one bot instance for your server/community). Appservice mode is for multi-tenant / “Draupnir-for-all” and is not covered here.
 
+**When federation is enabled:** Subscribe Draupnir to at least one community policy list before considering the server fully federated. Order: enable federation → run Draupnir → subscribe (e.g. `!draupnir watch #community-moderation-effort-bl:neko.dev` in the management room, or run `subscribe-draupnir-community-lists.sh`). See **[COMMUNITY-POLICY-LISTS.md](COMMUNITY-POLICY-LISTS.md)** for recommended lists (CME, Matrix.org COC, etc.).
+
 ---
 
 ## Adding Draupnir to an existing server (recommended path)

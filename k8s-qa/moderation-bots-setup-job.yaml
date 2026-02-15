@@ -1,0 +1,92 @@
+# One-time Job: create admin (if missing via registration), then @draupnir and @mjolnir (admin),
+# management rooms, get tokens. Outputs token/room lines for creating Secrets (see create-moderation-secrets-from-job.sh).
+# Requires: Synapse up; Secret matrix-qa-admin with key admin-password (or job fails).
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: moderation-bots-setup
+  namespace: matrix-qa
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: setup
+          image: curlimages/curl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              BASE="${SYNAPSE_BASE_URL:-http://synapse:8008}"
+              SERVER_NAME="${MATRIX_SERVER_NAME:-qa.local}"
+              REG_SECRET="${MATRIX_REGISTRATION_SHARED_SECRET:-qa-test-registration-secret}"
+              ADMIN_PASS="${ADMIN_PASSWORD}"
+              [ -z "$ADMIN_PASS" ] && echo "ADMIN_PASSWORD not set" && exit 1
+
+              # 1) Get admin token; if login fails, register admin with shared secret then login
+              ADMIN_TOKEN=$(curl -sS -X POST "$BASE/_matrix/client/r0/login" -H "Content-Type: application/json" \
+                -d "{\"type\":\"m.login.password\",\"user\":\"admin\",\"password\":\"$ADMIN_PASS\"}" 2>/dev/null | tr -d '\n' | sed 's/.*"access_token":"\([^"]*\)".*/\1/')
+              if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
+                nonce_body=$(curl -sS "$BASE/_synapse/admin/v1/register" 2>/dev/null)
+                nonce=$(echo "$nonce_body" | tr -d '\n' | sed 's/.*"nonce":"\([^"]*\)".*/\1/')
+                [ -z "$nonce" ] && echo "Could not get registration nonce" && exit 1
+                mac=$(printf '%s\0%s\0%s\0admin' "$nonce" "admin" "$ADMIN_PASS" | openssl dgst -sha1 -hmac "$REG_SECRET" 2>/dev/null | awk '{print $2}')
+                reg_resp=$(curl -sS -X POST "$BASE/_synapse/admin/v1/register" -H "Content-Type: application/json" \
+                  -d "{\"nonce\":\"$nonce\",\"username\":\"admin\",\"password\":\"$ADMIN_PASS\",\"admin\":true,\"mac\":\"$mac\"}" 2>/dev/null)
+                ADMIN_TOKEN=$(echo "$reg_resp" | tr -d '\n' | sed 's/.*"access_token":"\([^"]*\)".*/\1/')
+              fi
+              [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ] && echo "Failed to get admin token" && exit 1
+
+              # 2) Create @draupnir and @mjolnir (Admin API)
+              DRAUPNIR_PASS="${DRAUPNIR_PASSWORD:-$(head -c 24 /dev/urandom | base64)}"
+              MJOLNIR_PASS="${MJOLNIR_PASSWORD:-$(head -c 24 /dev/urandom | base64)}"
+              curl -sS -X PUT "$BASE/_synapse/admin/v2/users/@draupnir:$SERVER_NAME" \
+                -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+                -d "{\"password\":\"$DRAUPNIR_PASS\",\"admin\":true,\"logout_devices\":false}" || true
+              curl -sS -X PUT "$BASE/_synapse/admin/v2/users/@mjolnir:$SERVER_NAME" \
+                -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+                -d "{\"password\":\"$MJOLNIR_PASS\",\"admin\":true,\"logout_devices\":false}" || true
+
+              # 3) Get bot tokens
+              DRAUPNIR_TOKEN=$(curl -sS -X POST "$BASE/_matrix/client/r0/login" -H "Content-Type: application/json" \
+                -d "{\"type\":\"m.login.password\",\"user\":\"draupnir\",\"password\":\"$DRAUPNIR_PASS\"}" | tr -d '\n' | sed 's/.*"access_token":"\([^"]*\)".*/\1/')
+              MJOLNIR_TOKEN=$(curl -sS -X POST "$BASE/_matrix/client/r0/login" -H "Content-Type: application/json" \
+                -d "{\"type\":\"m.login.password\",\"user\":\"mjolnir\",\"password\":\"$MJOLNIR_PASS\"}" | tr -d '\n' | sed 's/.*"access_token":"\([^"]*\)".*/\1/')
+              [ -z "$DRAUPNIR_TOKEN" ] && exit 1
+              [ -z "$MJOLNIR_TOKEN" ] && exit 1
+
+              # 4) Create management rooms
+              DRAUPNIR_ROOM=$(curl -sS -X POST "$BASE/_matrix/client/r0/createRoom" -H "Authorization: Bearer $DRAUPNIR_TOKEN" \
+                -H "Content-Type: application/json" -d '{"name":"Draupnir management","preset":"private_chat"}' | tr -d '\n' | sed 's/.*"room_id":"\([^"]*\)".*/\1/')
+              MJOLNIR_ROOM=$(curl -sS -X POST "$BASE/_matrix/client/r0/createRoom" -H "Authorization: Bearer $MJOLNIR_TOKEN" \
+                -H "Content-Type: application/json" -d '{"name":"Mjolnir management","preset":"private_chat"}' | tr -d '\n' | sed 's/.*"room_id":"\([^"]*\)".*/\1/')
+              [ -z "$DRAUPNIR_ROOM" ] && exit 1
+              [ -z "$MJOLNIR_ROOM" ] && exit 1
+
+              # 5) Invite admin to both management rooms
+              curl -sS -X POST "$BASE/_matrix/client/r0/rooms/$DRAUPNIR_ROOM/invite" -H "Authorization: Bearer $DRAUPNIR_TOKEN" \
+                -H "Content-Type: application/json" -d "{\"user_id\":\"@admin:$SERVER_NAME\"}" || true
+              curl -sS -X POST "$BASE/_matrix/client/r0/rooms/$MJOLNIR_ROOM/invite" -H "Authorization: Bearer $MJOLNIR_TOKEN" \
+                -H "Content-Type: application/json" -d "{\"user_id\":\"@admin:$SERVER_NAME\"}" || true
+
+              # 6) Output for create-moderation-secrets-from-job.sh
+              echo "DRAUPNIR_ACCESS_TOKEN=$DRAUPNIR_TOKEN"
+              echo "DRAUPNIR_MANAGEMENT_ROOM=$DRAUPNIR_ROOM"
+              echo "MJOLNIR_ACCESS_TOKEN=$MJOLNIR_TOKEN"
+              echo "MJOLNIR_MANAGEMENT_ROOM=$MJOLNIR_ROOM"
+          env:
+            - name: SYNAPSE_BASE_URL
+              value: "http://synapse:8008"
+            - name: MATRIX_SERVER_NAME
+              value: "qa.local"
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: matrix-qa-admin
+                  key: admin-password
+          volumeMounts: []
+      volumes: []

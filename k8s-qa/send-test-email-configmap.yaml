@@ -1,0 +1,35 @@
+# ConfigMap for the "send one test email" job. No secrets; credentials come from Secret msmtp-credentials.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: send-test-email-script
+  namespace: matrix-qa
+data:
+  send_one_email.py: |
+    #!/usr/bin/env python3
+    """Send one test email via Gmail SMTP. Reads ALERT_EMAIL and SMTP_APP_PASSWORD from env."""
+    import os
+    import smtplib
+    import sys
+    from email.mime.text import MIMEText
+
+    to_addr = os.environ.get("ALERT_EMAIL", "").strip()
+    password = (os.environ.get("SMTP_APP_PASSWORD") or os.environ.get("password") or "").strip()
+    if not to_addr or not password:
+        print("Missing ALERT_EMAIL or SMTP_APP_PASSWORD in env", file=sys.stderr)
+        sys.exit(1)
+    from_addr = to_addr
+    msg = MIMEText("k8s-qa email test: msmtp/alert path works. (Fail2ban and Monit use this same path on the VM.)")
+    msg["Subject"] = "k8s-qa email test"
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as s:
+            s.starttls()
+            s.login(from_addr, password.strip())
+            s.sendmail(from_addr, [to_addr], msg.as_string())
+        print("Sent test email to", to_addr)
+    except Exception as e:
+        print("Send failed:", e, file=sys.stderr)
+        sys.exit(1)

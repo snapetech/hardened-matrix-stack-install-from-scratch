@@ -1,0 +1,21 @@
+# One-off Job to verify Coturn is reachable from inside the cluster (TCP 3478).
+# Apply after coturn.yaml; then: kubectl wait --for=condition=complete job/coturn-test -n matrix-qa --timeout=30s
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: coturn-test
+  namespace: matrix-qa
+spec:
+  ttlSecondsAfterFinished: 120
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: test
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - nc -zv coturn 3478 || exit 1

@@ -1,0 +1,83 @@
+# Coturn (TURN/STUN) for voice/video. Optional; when applied, Synapse gets turn.yaml (same as VM installer).
+# Clients need a reachable TURN host; in k8s QA we use in-cluster host for config test.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: coturn
+  namespace: matrix-qa
+type: Opaque
+stringData:
+  turn_shared_secret: "qa-turn-secret-min-32-chars"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coturn
+  namespace: matrix-qa
+spec:
+  ports:
+    - port: 3478
+      targetPort: 3478
+      name: turn-udp
+    - port: 3478
+      targetPort: 3478
+      name: turn-tcp
+  selector:
+    app: coturn
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coturn
+  namespace: matrix-qa
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coturn
+  template:
+    metadata:
+      labels:
+        app: coturn
+    spec:
+      containers:
+        - name: coturn
+          image: coturn/coturn:1.2
+          args:
+            - -c
+            - /etc/coturn/turnserver.conf
+          volumeMounts:
+            - name: config
+              mountPath: /etc/coturn
+              readOnly: true
+          ports:
+            - containerPort: 3478
+              name: turn-udp
+              protocol: UDP
+            - containerPort: 3478
+              name: turn-tcp
+              protocol: TCP
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+      volumes:
+        - name: config
+          configMap:
+            name: coturn-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coturn-config
+  namespace: matrix-qa
+data:
+  turnserver.conf: |
+    listening-port=3478
+    fingerprint
+    use-auth-secret
+    static-auth-secret=qa-turn-secret-min-32-chars
+    realm=qa.local
+    no-multicast-peers
+    no-cli

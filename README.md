@@ -25,7 +25,7 @@ The script prompts for:
 | **Matrix server name** | `example.com` | MXID domain (`@user:example.com`). |
 | **Root domain for .well-known** | `example.com` | Where `/.well-known/matrix/client` is served. |
 | **Email for Let's Encrypt** | `admin@example.com` | Cert expiry and recovery. |
-| **Enable federation?** | n | Open to other Matrix servers or client-only. Default is off (spam-free federation surface). |
+| **Enable federation?** | n | Open to other Matrix servers or client-only. Default is off. **If you choose federation, a moderation bot (Draupnir or Mjolnir) is required** and the script will subscribe it to the CME community list; see [COMMUNITY-POLICY-LISTS.md](COMMUNITY-POLICY-LISTS.md). |
 | **Install coturn?** | y | TURN/STUN for voice and video. |
 | **Monitoring backend** | netdata | (n)one / (net)data / (prom)etheus — exactly one. |
 | **Install Element Call / LiveKit?** | n | Docker-based voice/video SFU (MatrixRTC). |
@@ -52,7 +52,7 @@ The script prompts for:
 10. **Backup:** `/opt/matrix-backup/backup-matrix.sh` and cron at 03:00.
 11. **Email alerts (optional):** msmtp + msmtp-mta (sendmail shim), fail2ban email on ban, Monit (load/memory/disk + nginx/synapse/Docker checks), daily digest at 08:00. See **setup-email-alerts.sh** (prompts for alert email and Gmail App Password).
 12. **Healthcheck (optional):** **matrix-stack-healthcheck.sh** — systemd timer every 5 min (restart failed systemd units and Docker containers), Monit check with `--check-only`. Optional: `--clear-fail2ban` to unban all IPs in all jails; `--allow-reboot` for reboot-after-critical-failure. Log: `/var/log/matrix-healthcheck.log`.
-13. **Moderation bot (optional, one of):** **Draupnir** (recommended) or **Mjolnir**; creates `@draupnir` or `@mjolnir:SERVER_NAME`, management room, token; runs in Docker. See [DRAUPNIR-INTEGRATION.md](DRAUPNIR-INTEGRATION.md) for remote activation.
+13. **Moderation bot (optional, or required when federation is on):** **Draupnir** (recommended) or **Mjolnir**; creates `@draupnir` or `@mjolnir:SERVER_NAME`, management room, token; runs in Docker. When federation is enabled, the script subscribes the bot to the CME community list. See [DRAUPNIR-INTEGRATION.md](DRAUPNIR-INTEGRATION.md) and [COMMUNITY-POLICY-LISTS.md](COMMUNITY-POLICY-LISTS.md).
 14. **Maubot (optional):** Creates `@maubot:SERVER_NAME`; writes `/opt/maubot/config.yaml`. You run Maubot (pip or Docker) yourself.
 15. **Discord bridge (optional):** Writes `/opt/discord-bridge/config.yaml`; if `npx` is available, generates registration and adds Synapse appservice config; you start the bridge (Node or Docker).
 
@@ -71,12 +71,12 @@ Defaults: `MATRIX_DOMAIN=matrix.qa.local`, `SERVER_NAME=qa.local`, `USE_SELF_SIG
 
 ## Testing in Kubernetes
 
-To run the Matrix client API test suite against a minimal Synapse instance in any Kubernetes cluster (k3s, kind, minikube, etc.):
+Full E2E QA in any Kubernetes cluster (k3s, kind, minikube, etc.): deploy Synapse (optional Postgres, optional LiveKit for calls), then run the comprehensive test suite headless.
 
-1. **Deploy:** `kubectl apply -f k8s-qa/` (wait for pod `1/1` Ready).
-2. **Run tests:** From repo root, `./k8s-qa/run-matrix-qa-tests.sh` (NodePort 30048), or `./k8s-qa/port-forward-and-test.sh` when not on the node.
+1. **Deploy and test in one go:** From repo root, `./k8s-qa/deploy-and-test.sh` (deploys all, port-forwards if needed, runs API + multi-user + file + call tests).
+2. **Or deploy then test:** `kubectl apply -f k8s-qa/`, then `./k8s-qa/run-matrix-qa-tests.sh` (API only) or `./k8s-qa/run-e2e-qa.sh` with `LIVEKIT_WS_URL` and `LIVEKIT_JWT_URL` for call tests.
 
-See **[k8s-qa/README.md](k8s-qa/README.md)** for deploy, access (NodePort / port-forward), test script options, and teardown.
+See **[k8s-qa/README.md](k8s-qa/README.md)** for deploy options (minimal vs full stack), access (NodePort / port-forward), and **[k8s-qa/TEST-MATRIX.md](k8s-qa/TEST-MATRIX.md)** for the full test matrix (auth, E2EE, file share, voice/video, 3–5 user group calls).
 
 ## Contents of this repo
 
@@ -92,10 +92,11 @@ See **[k8s-qa/README.md](k8s-qa/README.md)** for deploy, access (NodePort / port
 - **netdata/** — Netdata bind-to-localhost config for use behind nginx.
 - **metrics-auth-proxy.py**, **metrics-auth-proxy.service** — Gated metrics (Netdata or Prometheus) behind Synapse login.
 - **draupnir-production.yaml**, **setup-draupnir.sh**, **apply-draupnir-remote.sh** — Draupnir (moderation bot) config template, standalone setup, and remote deploy. See [DRAUPNIR-INTEGRATION.md](DRAUPNIR-INTEGRATION.md).
+- **COMMUNITY-POLICY-LISTS.md** — Recommended community block/deny lists (CME, Matrix.org COC, etc.); **subscribe-draupnir-community-lists.sh** / **subscribe-mjolnir-community-lists.sh** — send watch commands to the management room. When federation is on, the installer subscribes to CME by default.
 - **mjolnir-production.yaml**, **setup-mjolnir.sh** — Mjolnir config template and standalone setup helper.
 - **maubot-patch.yaml**, **setup-maubot-user.sh** — Maubot config and user-creation helper.
 - **discord-bridge-config.yaml**, **synapse-appservice-discord.yaml** — Discord bridge template and Synapse appservice include.
-- **k8s-qa/** — Kubernetes manifests and scripts to run a minimal Synapse QA instance and the Matrix API test suite; see [k8s-qa/README.md](k8s-qa/README.md).
+- **k8s-qa/** — Kubernetes QA: Synapse (optional Postgres), optional LiveKit + lk-jwt for Element Call, and full headless test suite (API, multi-user, E2EE, file share, voice/video calls). See [k8s-qa/README.md](k8s-qa/README.md) and [k8s-qa/TEST-MATRIX.md](k8s-qa/TEST-MATRIX.md).
 
 ## After setup
 

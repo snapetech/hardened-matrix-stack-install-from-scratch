@@ -1,0 +1,77 @@
+# Mjolnir moderation bot. Requires: moderation-bots-setup Job run and create-moderation-secrets-from-job.sh (Secret mjolnir-config).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mjolnir
+  namespace: matrix-qa
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mjolnir
+  template:
+    metadata:
+      labels:
+        app: mjolnir
+    spec:
+      initContainers:
+        - name: write-config
+          image: busybox:1.36
+          env:
+            - name: HOMESERVER_URL
+              value: "http://synapse:8008"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              H="${HOMESERVER_URL:-http://synapse:8008}"
+              T="$(cat /secret/access_token)"
+              R="$(cat /secret/management_room)"
+              cat << EOF > /out/production.yaml
+              homeserverUrl: "$H"
+              rawHomeserverUrl: "$H"
+              accessToken: "$T"
+              managementRoom: "$R"
+              encryption:
+                use: false
+              dataPath: /data/storage
+              autojoinOnlyIfManager: true
+              verboseLogging: false
+              logLevel: INFO
+              syncOnStartup: true
+              verifyPermissionsOnStartup: true
+              noop: false
+              commands:
+                allowNoPrefix: false
+                confirmWildcardBan: true
+              protectAllJoinedRooms: false
+              EOF
+          volumeMounts:
+            - name: secret
+              mountPath: /secret
+              readOnly: true
+            - name: out
+              mountPath: /out
+      containers:
+        - name: mjolnir
+          image: matrixdotorg/mjolnir:latest
+          args:
+            - /usr/bin/node
+            - lib/index.js
+            - -c
+            - /config/production.yaml
+          volumeMounts:
+            - name: out
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: secret
+          secret:
+            secretName: mjolnir-config
+        - name: out
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
