@@ -25,7 +25,7 @@ The script prompts for:
 | **Matrix server name** | `example.com` | MXID domain (`@user:example.com`). |
 | **Root domain for .well-known** | `example.com` | Where `/.well-known/matrix/client` is served. |
 | **Email for Let's Encrypt** | `admin@example.com` | Cert expiry and recovery. |
-| **Enable federation?** | n | Open to other Matrix servers or client-only. |
+| **Enable federation?** | n | Open to other Matrix servers or client-only. Default is off (spam-free federation surface). |
 | **Install coturn?** | y | TURN/STUN for voice and video. |
 | **Monitoring backend** | netdata | (n)one / (net)data / (prom)etheus — exactly one. |
 | **Install Element Call / LiveKit?** | n | Docker-based voice/video SFU (MatrixRTC). |
@@ -79,7 +79,7 @@ See **[k8s-qa/README.md](k8s-qa/README.md)** for deploy, access (NodePort / port
 - **SETUP-FROM-SCRATCH.md** — Detailed setup and prompts.
 - **backup-matrix.sh** — Backup script (Synapse DB, media, conf.d, server config including Element Call, Draupnir/Mjolnir, Maubot, Discord).
 - **element-call/** — `docker-compose.yml` and `livekit.yaml.template` for Element Call / LiveKit.
-- **synapse-*.yaml**, **nginx-*.conf** — Config snippets and templates.
+- **synapse-*.yaml**, **nginx-*.conf** — Config snippets and templates. **synapse-no-federation.yaml**, **nginx-no-federation.conf** — Default no-federation (spam-free); **validate-no-federation.sh**, **apply-no-federation-remote.sh** — Validate and apply on existing servers.
 - **fail2ban-matrix/** — Filter and jail for Synapse auth.
 - **netdata/** — Netdata bind-to-localhost config for use behind nginx.
 - **metrics-auth-proxy.py**, **metrics-auth-proxy.service** — Gated metrics (Netdata or Prometheus) behind Synapse login.
