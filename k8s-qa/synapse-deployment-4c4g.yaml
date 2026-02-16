@@ -1,11 +1,6 @@
-# Synapse QA: minimal instance for testing the Matrix client API in Kubernetes.
-# Init generates config+keys; main runs Synapse. No TLS (use NodePort or port-forward).
-# With postgres.yaml applied, Synapse uses PostgreSQL; otherwise SQLite.
-#
-# Server resource config for load-test comparison (this file = 1c/1g):
-#   - This deployment: Synapse limits 1 CPU / 1 Gi (nail down server load at 1–10 participants).
-#   - For 4c/4g: kubectl apply -f k8s-qa/synapse-deployment-4c4g.yaml (same deployment name, replaces this).
-# Apply: kubectl apply -f k8s-qa/
+# Synapse server at 4 CPU / 4 Gi (for load-test comparison with 1c/1g).
+# Apply this after synapse-deployment.yaml to switch server to 4c/4g, then run ramp 1–10 to compare server load.
+# To switch back to 1c/1g: kubectl apply -f k8s-qa/synapse-deployment.yaml
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -50,7 +45,6 @@ spec:
               sed -i 's/^registration_shared_secret:.*/registration_shared_secret: "qa-test-registration-secret"/' /data/homeserver.yaml || echo 'registration_shared_secret: "qa-test-registration-secret"' >> /data/homeserver.yaml
               grep -q "enable_registration_without_verification" /data/homeserver.yaml || printf '\nenable_registration_without_verification: true\n' >> /data/homeserver.yaml
               mkdir -p /data/conf.d
-              # QA only: relax all client-facing rate limits so create_test_users and ramp never see 429. Live/VM deploy does not use this manifest.
               { printf '%s\n' "ratelimiting:" "  rc_registration:" "    per_second: 100" "    burst_count: 1000" "  rc_login:" "    address:" "      per_second: 100" "      burst_count: 1000" "    account:" "      per_second: 100" "      burst_count: 1000" "    failed_attempts:" "      per_second: 100" "      burst_count: 1000" "  rc_message:" "    per_second: 100" "    burst_count: 1000" "  rc_joins:" "    per_second: 100" "    burst_count: 1000" "  rc_delayed_event_mgmt:" "    per_second: 100" "    burst_count: 1000"; } > /data/conf.d/98-ratelimit-qa.yaml
               printf 'enable_metrics: true\nlisteners:\n  - port: 8008\n    tls: false\n    type: http\n    x_forwarded: true\n    bind_addresses: ["0.0.0.0"]\n    resources:\n      - names: [client, federation, metrics]\n        compress: false\n' > /data/conf.d/99-metrics.yaml
               chown -R 991:991 /data
@@ -101,7 +95,6 @@ spec:
       containers:
         - name: synapse
           image: matrixdotorg/synapse:v1.107.0
-          # Load homeserver.yaml + conf.d (database.yaml, turn.yaml) so we use Postgres and TURN
           command:
             - /bin/sh
             - -c
@@ -120,35 +113,11 @@ spec:
             periodSeconds: 5
           resources:
             requests:
-              memory: "512Mi"
-              cpu: "500m"
-            limits:
               memory: "1Gi"
               cpu: "1000m"
+            limits:
+              memory: "4Gi"
+              cpu: "4000m"
       volumes:
         - name: data
           emptyDir: {}
----
-# ClusterIP only; all client traffic goes through nginx (NodePort 30048).
-apiVersion: v1
-kind: Service
-metadata:
-  name: synapse
-  namespace: matrix-qa
-spec:
-  type: ClusterIP
-  selector:
-    app: synapse
-  ports:
-    - port: 8008
-      targetPort: 8008
-      name: http
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: synapse-secrets
-  namespace: matrix-qa
-type: Opaque
-stringData:
-  registration-shared-secret: "qa-test-registration-secret"
