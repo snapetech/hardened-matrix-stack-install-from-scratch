@@ -22,7 +22,7 @@ Minimal or full Matrix stack in Kubernetes for QA: Synapse (SQLite or Postgres),
 | File | Purpose |
 |------|---------|
 | **namespace.yaml** | `matrix-qa` namespace |
-| **00-budget.yaml** | Optional: ResourceQuota + LimitRange for 1 vCPU / 1 GiB node; apply with namespace before other manifests. See **SMALL-CLUSTER.md**. |
+| **00-budget.yaml** | Optional: ResourceQuota + LimitRange for 1 vCPU / 1 GiB node; apply with namespace before other manifests. See **../docs/SMALL-CLUSTER.md**. |
 | **synapse-deployment.yaml** | Synapse pod (init: generate + config + optional Postgres), Service ClusterIP (backend only). |
 | **nginx-configmap.yaml** + **nginx.yaml** | nginx reverse proxy: proxy to Synapse, rate-limit login/register, no-federation. Single entrypoint NodePort 30048. |
 | **postgres.yaml** | Optional PostgreSQL for Synapse (Deployment + Service + Secret). Synapse uses it when this is applied. |
@@ -43,8 +43,8 @@ Minimal or full Matrix stack in Kubernetes for QA: Synapse (SQLite or Postgres),
 | **ensure-moderation-bots-configmap.yaml** + **ensure-moderation-bots-cronjob.yaml** | Script + CronJob: add bots to all rooms and make them room admins (every 10 min). |
 | **ensure-moderation-bots-in-rooms.sh** | Standalone script (same logic as CronJob); for VM or one-off run. |
 | **nginx-configmap-federation.yaml** | Optional: nginx config with federation allowed and .well-known/matrix/server for federation tests. |
-| **TEST-MATRIX.md** | Full test matrix: every feature and workflow (auth, rooms, E2EE, file share, voice/video calls, moderation bots, optional email) |
-| **SMALL-CLUSTER.md** | Running on 1 vCPU / 1 GiB: minikube flags, resource budget (00-budget.yaml), per-component limits, load-test tips for calls. |
+| **../docs/TEST-MATRIX.md** | Full test matrix: every feature and workflow (auth, rooms, E2EE, file share, voice/video calls, moderation bots, optional email) |
+| **../docs/SMALL-CLUSTER.md** | Running on 1 vCPU / 1 GiB: minikube flags, resource budget (00-budget.yaml), per-component limits, load-test tips for calls. |
 
 ## Deploy
 
@@ -58,7 +58,7 @@ kubectl apply -f k8s-qa/
 If you apply the whole directory, `send-test-email-configmap.yaml` and `send-test-email-job.yaml` are included; the Job runs once. Without the `msmtp-credentials` Secret it will fail (safe to ignore or delete the job). To deploy without the email Job, apply only: `namespace.yaml`, `postgres.yaml`, `synapse-deployment.yaml`, `nginx-configmap.yaml`, `nginx.yaml`, `coturn.yaml`, `livekit.yaml`. `deploy-and-test.sh` applies that set.
 
 - **Moderation bots (Draupnir + Mjolnir):** Create Secret `matrix-qa-admin` with key `admin-password`, then run `deploy-and-test.sh` (or apply moderation-bots-setup-job, wait for completion, run `create-moderation-secrets-from-job.sh`, then apply draupnir.yaml, mjolnir.yaml, ensure-moderation-bots-configmap, ensure-moderation-bots-cronjob). Bots are added to all rooms and made room admins by the CronJob. To run the moderation-bots test: `MODERATION_BOTS_TEST=1 MATRIX_QA_ADMIN_PASSWORD=<admin-pass> ./k8s-qa/run-matrix-qa-tests.sh`.
-- **Federation (optional):** Apply `nginx-configmap-federation.yaml` and restart nginx to allow `/_matrix/federation` and serve `/.well-known/matrix/server`. **When federating, subscribe Draupnir/Mjolnir to at least one community policy list** (see repo `COMMUNITY-POLICY-LISTS.md`). Default list: `#community-moderation-effort-bl:neko.dev` (CME). In management room: `!draupnir watch #community-moderation-effort-bl:neko.dev` or use `subscribe-draupnir-community-lists.sh`. Test 30 sends the watch command and asserts success.
+- **Federation (optional):** Apply `nginx-configmap-federation.yaml` and restart nginx to allow `/_matrix/federation` and serve `/.well-known/matrix/server`. **When federating, subscribe Draupnir/Mjolnir to at least one community policy list** (see repo **docs/COMMUNITY-POLICY-LISTS.md**). Default list: `#community-moderation-effort-bl:neko.dev` (CME). In management room: `!draupnir watch #community-moderation-effort-bl:neko.dev` or use `subscribe-draupnir-community-lists.sh`. Test 30 sends the watch command and asserts success.
 - **Minimal (Synapse + nginx):** Apply `namespace.yaml`, `synapse-deployment.yaml`, `nginx-configmap.yaml`, `nginx.yaml`. All client traffic goes through nginx (NodePort 30048) so we QA proxy, rate-limit, and no-federation.
 - **With Postgres:** Also apply `postgres.yaml`. Synapse init will detect the postgres Secret and use PostgreSQL.
 - **With LiveKit (calls):** Also apply `livekit.yaml`. Expose NodePorts 30049 (LiveKit WS) and 30050 (lk-jwt).
@@ -185,9 +185,9 @@ MATRIX_QA_SKIP=rate_limit,file_upload ./k8s-qa/run-matrix-qa-tests.sh
 
 ## Test matrix
 
-See **[TEST-MATRIX.md](TEST-MATRIX.md)** for the full list of test cases: discovery, auth, rooms (encrypted and unencrypted), multi-user messaging, file upload/download, voice/video calls, moderation bots (in-room + admin PL), and community-list subscription (send `!draupnir watch` to management room). All run headless in k8s or on a VM.
+See **[docs/TEST-MATRIX.md](../docs/TEST-MATRIX.md)** for the full list of test cases: discovery, auth, rooms (encrypted and unencrypted), multi-user messaging, file upload/download, voice/video calls, moderation bots (in-room + admin PL), and community-list subscription (send `!draupnir watch` to management room). All run headless in k8s or on a VM.
 
-**Live integration (VM installer):** The same workflow is used in the repo’s VM installer: when federation is enabled, a moderation bot (Draupnir or Mjolnir) is required; the installer subscribes it to the CME community list. Ensure-bots-in-rooms cron and community list scripts are in the repo root: `ensure-moderation-bots-in-rooms.sh`, `subscribe-draupnir-community-lists.sh`, `subscribe-mjolnir-community-lists.sh`, and [COMMUNITY-POLICY-LISTS.md](../COMMUNITY-POLICY-LISTS.md).
+**Live integration (VM installer):** The same workflow is used in the repo’s VM installer: when federation is enabled, a moderation bot (Draupnir or Mjolnir) is required; the installer subscribes it to the CME community list. Ensure-bots-in-rooms cron and community list scripts are in the repo root: `ensure-moderation-bots-in-rooms.sh`, `subscribe-draupnir-community-lists.sh`, `subscribe-mjolnir-community-lists.sh`, and [docs/COMMUNITY-POLICY-LISTS.md](../docs/COMMUNITY-POLICY-LISTS.md).
 
 ## Teardown
 

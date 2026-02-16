@@ -52,7 +52,7 @@ After the run, it prints a summary and the path to the backup script, DB config,
 6. **Fail2ban (optional):** Filter and jail for Matrix login/register (401/403/429); nginx rate-limit zones and hardening snippet (admin/metrics lockdown, rate-limited login/register).
 7. **Backup (optional):** `/opt/matrix-backup/backup-matrix.sh` and cron at 03:00.
 
-Element Call, Draupnir/Mjolnir, Maubot, and Discord bridge are optional; the script can install them when you choose the corresponding options. See README and [DRAUPNIR-INTEGRATION.md](DRAUPNIR-INTEGRATION.md).
+Element Call, Draupnir/Mjolnir, Maubot, and Discord bridge are optional; the script can install them when you choose the corresponding options. See README and [docs/DRAUPNIR-INTEGRATION.md](docs/DRAUPNIR-INTEGRATION.md).
 
 ---
 

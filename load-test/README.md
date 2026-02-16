@@ -63,7 +63,7 @@ The 1c/1g resource limit refers to the **Matrix stack in k8s** (Synapse, LiveKit
 On constrained **clusters or VPS** (the stack under test), use fewer participants and shorter duration to avoid OOM or safety triggers:
 
 - `--participants 2` or `3`, `--duration 60` or `120`
-- The scripts use 320×240 @ 15 fps video and synthetic audio; for even lighter load, you can reduce resolution/fps in `participant.py` or run LiveKit’s own `lk load-test` with `--video-resolution low --no-simulcast` (see k8s-qa/SMALL-CLUSTER.md).
+- The scripts use 320×240 @ 15 fps video and synthetic audio; for even lighter load, you can reduce resolution/fps in `participant.py` or run LiveKit’s own `lk load-test` with `--video-resolution low --no-simulcast` (see docs/SMALL-CLUSTER.md).
 
 ## Safety
 

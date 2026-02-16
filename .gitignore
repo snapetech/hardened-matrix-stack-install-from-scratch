@@ -1,3 +1,6 @@
+# Archives / build artifacts
+*.zip
+
 # Load-test: generated and secret files (tokens, passwords, server-specific config)
 load-test/.env
 load-test/config.yaml
