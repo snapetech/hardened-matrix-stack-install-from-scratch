@@ -32,7 +32,7 @@ services:
       - LIVEKIT_URL=wss://MATRIX_RTC_HOST/livekit/sfu
       - LIVEKIT_KEY=${LIVEKIT_KEY}
       - LIVEKIT_SECRET=${LIVEKIT_SECRET}
-      - LIVEKIT_FULL_ACCESS_HOMESERVERS=*
+      - LIVEKIT_FULL_ACCESS_HOMESERVERS=${LIVEKIT_FULL_ACCESS_HOMESERVERS}
     deploy:
       restart_policy:
         condition: on-failure

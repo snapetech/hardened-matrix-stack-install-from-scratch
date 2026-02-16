@@ -8,14 +8,15 @@ set -e
 BASE="${SYNAPSE_BASE_URL:-http://synapse:8008}"
 BASE="${BASE%/}"
 SERVER_NAME="${MATRIX_SERVER_NAME:-qa.local}"
-ADMIN_ID="@admin:$SERVER_NAME"
+ADMIN_USER="${MATRIX_ADMIN_USER:-admin}"
+ADMIN_ID="@${ADMIN_USER}:$SERVER_NAME"
 DRAUPNIR_ID="@draupnir:$SERVER_NAME"
 MJOLNIR_ID="@mjolnir:$SERVER_NAME"
 
 [ -n "$ADMIN_PASSWORD" ] || { echo "ADMIN_PASSWORD not set"; exit 1; }
 
 ADMIN_TOKEN=$(curl -sS -X POST "$BASE/_matrix/client/r0/login" -H "Content-Type: application/json" \
-  -d "{\"type\":\"m.login.password\",\"user\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" | jq -r '.access_token // empty')
+  -d "{\"type\":\"m.login.password\",\"user\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASSWORD\"}" | jq -r '.access_token // empty')
 [ -n "$ADMIN_TOKEN" ] || { echo "Failed to get admin token"; exit 1; }
 
 offset=0

@@ -50,6 +50,7 @@ INSTALL_DISCORD="${INSTALL_DISCORD:-n}"
 INSTALL_METRICS_AUTH="${INSTALL_METRICS_AUTH:-y}"
 ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
+MOD_BOT_ENV_FILE="${MOD_BOT_ENV_FILE:-/root/.config/matrix-stack/ensure-moderation-bots.env}"
 
 # --- State ---
 SYNAPSE_DB_PASSWORD=""
@@ -70,6 +71,26 @@ run_as_postgres() {
     # Use -- so su does not parse command args (e.g. psql -t, createuser -D) as su options
     su postgres -s /bin/bash -c 'exec "$@"' -- _ "$@"
   fi
+}
+
+write_moderation_env() {
+  local admin_localpart="$1"
+  local admin_password="$2"
+  [ -n "$admin_password" ] || return 0
+  local env_dir
+  env_dir="$(dirname "$MOD_BOT_ENV_FILE")"
+  mkdir -p "$env_dir"
+  local previous_umask
+  previous_umask="$(umask)"
+  umask 077
+  cat > "$MOD_BOT_ENV_FILE" << EOF
+ADMIN_PASSWORD=$admin_password
+MATRIX_ADMIN_USER=$admin_localpart
+SYNAPSE_BASE_URL=https://$MATRIX_DOMAIN
+MATRIX_SERVER_NAME=$SERVER_NAME
+EOF
+  chmod 600 "$MOD_BOT_ENV_FILE"
+  umask "$previous_umask"
 }
 
 # ========== No-systemd (container) support ==========
@@ -425,7 +446,7 @@ setup_nginx_tls() {
       openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout "$SSL_KEY_PATH" -out "$SSL_CERT_PATH" \
         -subj "/CN=$MATRIX_DOMAIN/O=Matrix QA"
-      chmod 644 "$SSL_CERT_PATH" "$SSL_KEY_PATH"
+      chmod 600 "$SSL_CERT_PATH" "$SSL_KEY_PATH"
     fi
     SSL_OPTIONS_INCLUDE="ssl_protocols TLSv1.2 TLSv1.3; ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;"
     echo "  Using self-signed cert (USE_SELF_SIGNED_CERT=1)."
@@ -613,6 +634,10 @@ setup_monitoring() {
     fi
     svc_enable netdata
     svc_start netdata
+    svc_stop prometheus 2>/dev/null || true
+    svc_disable prometheus 2>/dev/null || true
+    svc_stop node_exporter 2>/dev/null || true
+    svc_disable node_exporter 2>/dev/null || true
     echo "  Netdata installed (web UI on :19999, bound to localhost when gated)."
     return 0
   fi
@@ -684,6 +709,8 @@ PROMEOF
     svc_start node_exporter
     svc_enable prometheus
     svc_start prometheus
+    svc_stop netdata 2>/dev/null || true
+    svc_disable netdata 2>/dev/null || true
     echo "  Prometheus installed (UI on :9090, node_exporter on :9100, bound to localhost when gated)."
   fi
 }
@@ -815,11 +842,13 @@ EOF
   fi
   # .env for lk-jwt-service (LIVEKIT_URL must be wss://matrix-rtc host or same host /livekit/sfu)
   MATRIX_RTC_HOST="${MATRIX_RTC_HOST:-$MATRIX_DOMAIN}"
+  LIVEKIT_ALLOWED_HOMESERVERS="${LIVEKIT_ALLOWED_HOMESERVERS:-$SERVER_NAME}"
   cat > /opt/element-call/.env << EOF
 LIVEKIT_KEY=$LIVEKIT_KEY
 LIVEKIT_SECRET=$LIVEKIT_SECRET
 LIVEKIT_URL=wss://$MATRIX_RTC_HOST/livekit/sfu
 LIVEKIT_JWT_URL=https://$MATRIX_RTC_HOST/livekit/jwt
+LIVEKIT_FULL_ACCESS_HOMESERVERS=$LIVEKIT_ALLOWED_HOMESERVERS
 EOF
   [ -f "$REPO_DIR/element-call/docker-compose.yml" ] && cp "$REPO_DIR/element-call/docker-compose.yml" /opt/element-call/
   # Fix auth-service LIVEKIT_URL in compose (env sub is from .env; ensure host is correct)
@@ -859,6 +888,8 @@ with open(p, 'w') as f: json.dump(d, f, indent=2)
 location = /livekit/jwt { return 301 /livekit/jwt/; }
 location = /livekit/sfu { return 301 /livekit/sfu/; }
 location ^~ /livekit/jwt/ {
+    limit_req zone=login_zone burst=10 nodelay;
+    if ($http_authorization = "") { return 401; }
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -1119,10 +1150,8 @@ EOF
   echo "  Draupnir running (Docker container draupnir). Management room: $ROOM_ID (invited @$DRAP_ADMIN:$SERVER_NAME)."
   # Cron: ensure Draupnir (and Mjolnir if present) in all rooms as room admins
   command -v jq &>/dev/null || (apt-get update -qq && apt-get install -y -qq jq)
-  ENV_FILE="$REPO_DIR/.ensure-moderation-bots-env"
-  printf 'ADMIN_PASSWORD=%s\nSYNAPSE_BASE_URL=https://%s\nMATRIX_SERVER_NAME=%s\n' "${ADMIN_PASSWORD:-$MATRIX_PASSWORD}" "$MATRIX_DOMAIN" "$SERVER_NAME" > "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  CRON_CMD=". $ENV_FILE 2>/dev/null; [ -n \"\$ADMIN_PASSWORD\" ] && export SYNAPSE_BASE_URL MATRIX_SERVER_NAME ADMIN_PASSWORD && $REPO_DIR/k8s-qa/ensure-moderation-bots-in-rooms.sh"
+  write_moderation_env "$DRAP_ADMIN" "$ADMIN_PASSWORD"
+  CRON_CMD=". $MOD_BOT_ENV_FILE 2>/dev/null; [ -n \"\$ADMIN_PASSWORD\" ] || exit 0; export SYNAPSE_BASE_URL MATRIX_SERVER_NAME MATRIX_ADMIN_USER ADMIN_PASSWORD; $REPO_DIR/k8s-qa/ensure-moderation-bots-in-rooms.sh"
   (crontab -l 2>/dev/null | grep -v "ensure-moderation-bots-in-rooms"; echo "*/10 * * * * $CRON_CMD") | crontab - 2>/dev/null || true
   echo "  Cron: ensure-moderation-bots every 10 min (adds bots to all rooms as admins)."
   # When federation is on, subscribe to at least one community list (mandatory before considering server federated).
@@ -1208,10 +1237,8 @@ EOF
   echo "  Mjolnir running (Docker container mjolnir). Management room: $ROOM_ID (invited @$MJOLNIR_ADMIN:$SERVER_NAME)."
   # Cron: ensure Draupnir/Mjolnir in all rooms as room admins (same as Draupnir path)
   command -v jq &>/dev/null || (apt-get update -qq && apt-get install -y -qq jq)
-  ENV_FILE="$REPO_DIR/.ensure-moderation-bots-env"
-  printf 'ADMIN_PASSWORD=%s\nSYNAPSE_BASE_URL=https://%s\nMATRIX_SERVER_NAME=%s\n' "$ADMIN_PASSWORD" "$MATRIX_DOMAIN" "$SERVER_NAME" > "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  CRON_CMD=". $ENV_FILE 2>/dev/null; [ -n \"\$ADMIN_PASSWORD\" ] && export SYNAPSE_BASE_URL MATRIX_SERVER_NAME ADMIN_PASSWORD && $REPO_DIR/k8s-qa/ensure-moderation-bots-in-rooms.sh"
+  write_moderation_env "$MJOLNIR_ADMIN" "$ADMIN_PASSWORD"
+  CRON_CMD=". $MOD_BOT_ENV_FILE 2>/dev/null; [ -n \"\$ADMIN_PASSWORD\" ] || exit 0; export SYNAPSE_BASE_URL MATRIX_SERVER_NAME MATRIX_ADMIN_USER ADMIN_PASSWORD; $REPO_DIR/k8s-qa/ensure-moderation-bots-in-rooms.sh"
   (crontab -l 2>/dev/null | grep -v "ensure-moderation-bots-in-rooms"; echo "*/10 * * * * $CRON_CMD") | crontab - 2>/dev/null || true
   echo "  Cron: ensure-moderation-bots every 10 min (adds bots to all rooms as admins)."
   # When federation is on, subscribe to at least one community list.

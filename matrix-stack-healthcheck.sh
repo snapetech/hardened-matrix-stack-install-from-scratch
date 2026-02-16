@@ -23,9 +23,28 @@ LOG() { echo "$(date -Iseconds) $*" | tee -a "${LOG_FILE:-/var/log/matrix-health
 STATE_DIR="${STATE_DIR:-/var/lib/matrix-healthcheck}"
 REBOOT_MARKER="$STATE_DIR/request-reboot"
 FAILURE_COUNT="$STATE_DIR/failure-count"
+DOCKER_COMPOSE_BIN=""
 
 mkdir -p "$STATE_DIR"
 : >> "${LOG_FILE:-/var/log/matrix-healthcheck.log}"
+
+if command -v docker &>/dev/null; then
+  if docker compose version &>/dev/null; then
+    DOCKER_COMPOSE_BIN="docker compose"
+  elif command -v docker-compose &>/dev/null; then
+    DOCKER_COMPOSE_BIN="docker-compose"
+  fi
+fi
+
+docker_compose_exec() {
+  if [ "$DOCKER_COMPOSE_BIN" = "docker compose" ]; then
+    docker compose "$@"
+  elif [ "$DOCKER_COMPOSE_BIN" = "docker-compose" ]; then
+    docker-compose "$@"
+  else
+    return 1
+  fi
+}
 
 # --- Optional: clear all fail2ban blocks (unban every IP in every jail), then exit ---
 if [ "$CLEAR_FAIL2BAN" = true ]; then
@@ -104,14 +123,26 @@ if command -v docker &>/dev/null; then
   if [ -d /opt/element-call ] && [ -f /opt/element-call/docker-compose.yml ] && [ ! -f "$STATE_DIR/skip-element-call" ]; then
     (
       cd /opt/element-call
-      up=$(docker compose ps -q 2>/dev/null || docker-compose ps -q 2>/dev/null)
-      if [ -z "$up" ] || docker compose ps 2>/dev/null | grep -qE "Exit|exited|Restarting"; then
+      if [ -z "$DOCKER_COMPOSE_BIN" ]; then
+        LOG "element-call: docker compose not available"
+        exit 1
+      fi
+      up=$(docker_compose_exec ps -q 2>/dev/null || true)
+      compose_unhealthy=0
+      if docker_compose_exec ps 2>/dev/null | grep -qE "Exit|exited|Restarting"; then
+        compose_unhealthy=1
+      fi
+      if [ -z "$up" ] || [ "$compose_unhealthy" -eq 1 ]; then
         if [ "$CHECK_ONLY" = true ]; then
           LOG "element-call compose: not all running (no restart: --check-only)"
           exit 1
         fi
         LOG "element-call: bringing up..."
-        (docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null) && LOG "element-call: up OK" || exit 1
+        if docker_compose_exec up -d 2>/dev/null; then
+          LOG "element-call: up OK"
+        else
+          exit 1
+        fi
       fi
     ) || FAILED_ANY=true
   fi
