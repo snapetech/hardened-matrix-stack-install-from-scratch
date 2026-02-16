@@ -12,9 +12,11 @@ import argparse
 import collections
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -27,14 +29,15 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def get_load1_prometheus(prometheus_url: str) -> float | None:
-    """Query Prometheus for node_load1. Returns value or None on error."""
+def get_load1_prometheus(prometheus_url: str, query: str | None = None) -> float | None:
+    """Query Prometheus for load (default node_load1). Use safety.prometheus_load1_query or PROMETHEUS_LOAD1_QUERY to target a specific node."""
     if not prometheus_url:
         return None
+    q = (query or "").strip() or "node_load1"
     try:
         r = requests.get(
             f"{prometheus_url.rstrip('/')}/api/v1/query",
-            params={"query": "node_load1"},
+            params={"query": q},
             timeout=5,
         )
         r.raise_for_status()
@@ -163,10 +166,11 @@ def get_server_latency(server_url: str) -> tuple[int | None, float | None]:
         return None, None
 
 
-def get_load1(prometheus_url: str, safety_load_ssh: str | None = None) -> tuple[float | None, str]:
+def get_load1(prometheus_url: str, safety_load_ssh: str | None = None, load1_query: str | None = None) -> tuple[float | None, str]:
     """Return (load1, source). Tries Prometheus, then SSH, then local /proc/loadavg.
-    For --k8s-participants you must set safety_load_ssh to the k8s node (e.g. user@node-ip) so load is read from the node, not the orchestrator."""
-    load1 = get_load1_prometheus(prometheus_url)
+    For --k8s-participants you must set safety_load_ssh to the k8s node (e.g. user@node-ip) so load is read from the node, not the orchestrator.
+    Use load1_query (or safety.prometheus_load1_query / PROMETHEUS_LOAD1_QUERY) to target a specific node, e.g. node_load1{instance=\"node:9100\"}."""
+    load1 = get_load1_prometheus(prometheus_url, query=load1_query)
     if load1 is not None:
         return load1, "prometheus"
     if safety_load_ssh:
@@ -238,7 +242,7 @@ metadata:
   name: {job_name}
   namespace: {namespace}
 spec:
-  backoffLimit: 0
+  backoffLimit: 4
   ttlSecondsAfterFinished: 300
   template:
     spec:
@@ -269,6 +273,13 @@ spec:
             - name: users
               mountPath: /secrets
               readOnly: true
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
       volumes:
         - name: config
           configMap:
@@ -405,6 +416,30 @@ def _k8s_first_running_pod(namespace: str, job_name_prefix: str) -> str | None:
     return None
 
 
+def _k8s_list_running_loadtest_pods(namespace: str, job_name_prefix: str) -> list[tuple[str, int]]:
+    """Return list of (pod_name, job_index) for Running pods matching job prefix, sorted by job index."""
+    out = subprocess.run(
+        ["kubectl", "get", "pods", "-n", namespace, "-o", "json", "--field-selector=status.phase=Running"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if out.returncode != 0:
+        return []
+    # Pod name is like loadtest-p-0-abc12 -> job index 0
+    match_idx = re.compile(r"^" + re.escape(job_name_prefix) + r"(\d+)-").match
+    result = []
+    for item in json.loads(out.stdout).get("items", []):
+        name = item.get("metadata", {}).get("name", "")
+        if not name.startswith(job_name_prefix):
+            continue
+        m = match_idx(name)
+        if m:
+            result.append((name, int(m.group(1))))
+    result.sort(key=lambda x: x[1])
+    return result
+
+
 # Pod name prefixes for stack (server) vs loadtest (clients). Used to split kubectl top.
 _STACK_POD_PREFIXES = ("nginx-", "synapse-", "lk-jwt-", "livekit-", "postgres-")
 _LOADTEST_POD_PREFIX = "loadtest-p-"
@@ -464,19 +499,57 @@ def _k8s_pod_top_split(namespace: str) -> tuple[int, int, int, int, int, int]:
 
 
 def _k8s_pod_log_tail(namespace: str, pod_name: str, tail: int = 2) -> str:
-    """Return last tail lines of pod log (single line, no newlines)."""
+    """Return last tail lines of pod log (single line, no newlines). Combines stdout+stderr (participant prints proof to stderr)."""
     try:
         out = subprocess.run(
-            ["kubectl", "logs", "-n", namespace, pod_name, f"--tail={tail}"],
+            ["kubectl", "logs", "-n", namespace, pod_name, f"--tail={tail}", "--all-containers=true"],
             capture_output=True,
             text=True,
             timeout=8,
         )
-        if out.returncode == 0 and out.stdout:
-            return " ".join(out.stdout.strip().split())
+        if out.returncode == 0:
+            out_log = (out.stdout or "").strip()
+            err_log = (out.stderr or "").strip()
+            combined = out_log + (" " + err_log if err_log else "") or ""
+            if combined:
+                return " ".join(combined.split())
     except Exception:
         pass
     return ""
+
+
+def _extract_proof_from_log(log_text: str) -> str:
+    """Extract the most recent proof (cumulative video/audio frames) from participant log. Uses last match so p-0 shows higher count than p-9."""
+    if not log_text or "proof:" not in log_text:
+        return ""
+    # Match "proof: sent 692 video frames, 1463 audio frames" or "proof: total ..." — find ALL, use LAST (cumulative = latest is highest).
+    all_m = re.findall(
+        r"proof:\s+(?:sent|total)\s+(\d+)\s+video\s+frames?,?\s+(\d+)\s+audio", log_text, re.I
+    )
+    if all_m:
+        v, a = all_m[-1]
+        return f"{v}v {a}a"
+    all_m = re.findall(r"proof:\s+\S+\s+(\d+)\s+video\s+\S+\s+(\d+)\s+audio", log_text, re.I)
+    if all_m:
+        v, a = all_m[-1]
+        return f"{v}v {a}a"
+    return ""
+
+
+def _k8s_proof_per_participant(namespace: str, job_prefix: str) -> str:
+    """Get proof line from each running loadtest pod; return compact string like 'p-0 692v 1461a | p-1 ...'."""
+    pods = _k8s_list_running_loadtest_pods(namespace, job_prefix)
+    if not pods:
+        return "(no running pods)"
+    parts = []
+    for pod_name, idx in pods:
+        log = _k8s_pod_log_tail(namespace, pod_name, tail=80)
+        proof = _extract_proof_from_log(log)
+        if proof:
+            parts.append(f"p-{idx} {proof}")
+        else:
+            parts.append(f"p-{idx} (no proof yet)")
+    return " | ".join(parts)
 
 
 def _write_ramp_metrics_summary(load_samples_path: Path, results_dir: Path) -> None:
@@ -554,9 +627,182 @@ def _write_ramp_metrics_summary(load_samples_path: Path, results_dir: Path) -> N
         pass
 
 
-def _k8s_dump_job_logs(namespace: str, job_prefix: str, job_indices: list[int], tail: int = 80) -> None:
-    """Print kubectl logs for each job (e.g. to see why participants exited). Captures stdout + stderr."""
-    print("\n--- Job logs (last {} lines each) ---".format(tail), file=sys.stderr)
+def _write_participant_metrics_summary(load_test_dir: Path) -> None:
+    """Parse .participant_metrics_*.json; write results/participant_metrics_summary.json; print one-line summary and RX warning if needed."""
+    results_dir = load_test_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = results_dir / "participant_metrics_summary.json"
+    files = sorted(load_test_dir.glob(".participant_metrics_*.json"))
+    connected = 0
+    rx_pass = 0
+    remote_counts: list[int] = []
+    for path in files:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        events = data.get("events") or []
+        for ev in events:
+            op = ev.get("op")
+            if op == "livekit_connect" and ev.get("status") == 0:
+                connected += 1
+                break
+        for ev in events:
+            if ev.get("op") == "rx_validation" and ev.get("passed") is True:
+                rx_pass += 1
+                break
+        for ev in events:
+            if ev.get("op") == "lk_remote_snapshot":
+                remote_counts.append(ev.get("remote_participant_count", 0))
+                break
+    total = len(files)
+    avg_remote = round(sum(remote_counts) / len(remote_counts), 1) if remote_counts else None
+    out = {
+        "total_participants": total,
+        "connected": connected,
+        "rx_validation_pass": rx_pass,
+        "avg_remote_participants": avg_remote,
+    }
+    try:
+        with open(summary_path, "w") as f:
+            json.dump(out, f, indent=2)
+    except OSError:
+        return
+    print(
+        f"[participant summary] {connected} connected, {rx_pass} passed RX validation, avg remote participants={avg_remote}",
+        file=sys.stderr,
+    )
+    if connected > 1 and rx_pass == 0:
+        print(
+            "\n*** WARNING: Multiple participants connected but none received remote A/V (RX validation 0). "
+            "You may be measuring 'N isolated publishers' instead of a real call mesh. "
+            "Check: same room, subscriptions enabled (auto_subscribe), and SFU forwarding. ***\n",
+            file=sys.stderr,
+        )
+
+
+def _k8s_dump_why_no_pods(namespace: str, job_prefix: str, jobs_created: int, log_file: Path | None = None) -> None:
+    """Dump pod list and job describe/events so we can see why clients aren't running."""
+    lines = ["\n--- WHY (pod list + job describe for first jobs) ---"]
+    try:
+        out = subprocess.run(
+            ["kubectl", "get", "pods", "-n", namespace, "-o", "wide"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if out.returncode == 0 and out.stdout:
+            for line in out.stdout.strip().split("\n"):
+                if job_prefix in line or "NAME" in line:
+                    lines.append(line)
+        for i in range(min(3, jobs_created)):
+            job_name = f"{job_prefix}{i}"
+            out = subprocess.run(
+                ["kubectl", "describe", "job", job_name, "-n", namespace],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if out.returncode == 0 and out.stdout:
+                lines.append(f"\n--- describe {job_name} ---")
+                lines.append(out.stdout.strip())
+    except Exception as e:
+        lines.append(str(e))
+    lines.append("--- end WHY ---\n")
+    blob = "\n".join(lines)
+    print(blob, file=sys.stderr)
+    if log_file is not None:
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            existing = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
+            log_file.write_text(existing + blob + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
+def _k8s_interpret_stuck_pods(namespace: str, job_prefix: str) -> None:
+    """Look at current pod state and print a short interpretation so we don't ignore the dump."""
+    try:
+        out = subprocess.run(
+            ["kubectl", "get", "pods", "-n", namespace, "-o", "wide"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if out.returncode != 0 or not out.stdout:
+            return
+        running = 0
+        creating = 0
+        pending = 0
+        pending_pods: list[str] = []
+        for line in out.stdout.strip().split("\n"):
+            if job_prefix not in line or "NAME" in line:
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            name = parts[0]
+            status = parts[2]  # READY STATUS RESTARTS ...
+            if "Running" in status:
+                running += 1
+            elif "ContainerCreating" in status:
+                creating += 1
+            elif "Pending" in status:
+                pending += 1
+                pending_pods.append(name)
+        parts = []
+        if running:
+            parts.append(f"{running}r")
+        if creating:
+            parts.append(f"{creating} ContainerCreating")
+        if pending:
+            parts.append(f"{pending} Pending")
+        if not parts:
+            print("[ramp] Dump interpretation: no loadtest pods in get pods output.", file=sys.stderr)
+            return
+        msg = f"[ramp] Dump interpretation: {', '.join(parts)}."
+        if pending and pending_pods:
+            # Get reason for one Pending pod
+            desc = subprocess.run(
+                ["kubectl", "describe", "pod", pending_pods[0], "-n", namespace],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if desc.returncode == 0 and desc.stdout:
+                low = desc.stdout.lower()
+                if "exceeded quota" in low or "forbidden: exceeded quota" in low:
+                    msg += " Pending reason: EXCEEDED QUOTA — raise requests.cpu/limits.cpu (and/or memory) in k8s-qa/00-budget.yaml."
+                elif "failedscheduling" in low or "0/nodes are available" in low:
+                    if "insufficient cpu" in low or "cpu" in low:
+                        msg += " Pending reason: insufficient CPU (scheduling). Raise limits.cpu / check node capacity."
+                    elif "insufficient memory" in low or "memory" in low:
+                        msg += " Pending reason: insufficient memory (scheduling). Raise limits.memory."
+                    else:
+                        msg += " Pending reason: FailedScheduling — see describe in job_logs.txt."
+                elif "oomkilled" in low:
+                    msg += " Pending/restart: OOMKilled — raise pod memory limit or limits.memory quota."
+                else:
+                    msg += " Pending — check Events in job_logs.txt (kubectl describe pod)."
+        elif creating and not pending:
+            msg += " (new pod(s) still starting; if this stays for >30s, re-check quota.)"
+        print(msg, file=sys.stderr)
+    except Exception as e:
+        print(f"[ramp] Dump interpretation failed: {e}", file=sys.stderr)
+
+
+def _k8s_dump_job_logs(
+    namespace: str,
+    job_prefix: str,
+    job_indices: list[int],
+    tail: int = 80,
+    log_file: Path | None = None,
+    quiet: bool = False,
+) -> None:
+    """Get kubectl logs for each job. Write to log_file. If not quiet, also print to stderr (use quiet=True mid-run to avoid flooding console)."""
+    lines: list[str] = []
+    lines.append("\n--- Job logs (last {} lines each) ---".format(tail))
     seen_image_pull_error = False
     seen_401_get_token = False
     for i in job_indices:
@@ -566,7 +812,7 @@ def _k8s_dump_job_logs(namespace: str, job_prefix: str, job_indices: list[int], 
                 ["kubectl", "logs", "-n", namespace, f"job/{job_name}", f"--tail={tail}", "--all-containers=true"],
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=30,
             )
             out_log = (out.stdout or "").strip()
             err_log = (out.stderr or "").strip()
@@ -577,14 +823,37 @@ def _k8s_dump_job_logs(namespace: str, job_prefix: str, job_indices: list[int], 
                 seen_image_pull_error = True
             if any(s in log for s in ("401", "Unauthorized", "get_token")):
                 seen_401_get_token = True
-            print(f"\n--- {job_name} ---\n{log}", file=sys.stderr)
+            block = "\n--- {} ---\n{}".format(job_name, log)
+            lines.append(block)
+            if not quiet:
+                print(block, file=sys.stderr)
         except Exception as e:
-            print(f"\n--- {job_name} (failed to get logs: {e}) ---", file=sys.stderr)
+            block = "\n--- {} (failed to get logs: {}) ---".format(job_name, e)
+            lines.append(block)
+            if not quiet:
+                print(block, file=sys.stderr)
     if seen_image_pull_error:
-        print("\n>>> Image error: If 'ErrImageNeverPull', the image isn't on the node (preload went to different daemon/node or cluster uses containerd). Push to a registry and run without preload: docker push <registry>/load-test-participant:latest then ./run-ramp-k8s.sh ... --k8s-image <registry>/load-test-participant:latest (do not use --k8s-image-pull-policy Never). If 'image can\'t be pulled', use minikube docker-env or push to a registry.", file=sys.stderr)
+        msg = "\n>>> Image error: If 'ErrImageNeverPull', the image isn't on the node (preload went to different daemon/node or cluster uses containerd). Push to a registry and run without preload: docker push <registry>/load-test-participant:latest then ./run-ramp-k8s.sh ... --k8s-image <registry>/load-test-participant:latest (do not use --k8s-image-pull-policy Never). If 'image can\'t be pulled', use minikube docker-env or push to a registry."
+        lines.append(msg)
+        if not quiet:
+            print(msg, file=sys.stderr)
     if seen_401_get_token:
-        print("\n>>> Early exit + 401/get_token: ensure lk-jwt can reach OpenID userinfo (nginx .well-known m.server and /_matrix/federation/v1/openid/userinfo on 443/8448 with TLS). Restart lk-jwt after nginx changes.", file=sys.stderr)
-    print("--- end job logs ---\n", file=sys.stderr)
+        msg = "\n>>> Early exit + 401/get_token: ensure lk-jwt can reach OpenID userinfo (nginx .well-known m.server and /_matrix/federation/v1/openid/userinfo on 443/8448 with TLS). Restart lk-jwt after nginx changes."
+        lines.append(msg)
+        if not quiet:
+            print(msg, file=sys.stderr)
+    lines.append("--- end job logs ---\n")
+    if not quiet:
+        print("--- end job logs ---\n", file=sys.stderr)
+    if log_file is not None:
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            log_file.write_text("\n".join(lines), encoding="utf-8")
+            if not quiet:
+                print("Job logs written to:", log_file, file=sys.stderr)
+                sys.stderr.flush()
+        except OSError:
+            pass
 
 
 def _k8s_wait_jobs(namespace: str, job_name_prefix: str, timeout_sec: int = 600) -> tuple[int, int]:
@@ -641,6 +910,7 @@ def _run_k8s_participants(
     consecutive_errors_max = safety_cfg.get("consecutive_errors_max", 5)
     prometheus_url = (os.environ.get("PROMETHEUS_URL") or safety_cfg.get("prometheus_url") or "").strip()
     safety_load_ssh = (os.environ.get("SAFETY_LOAD_SSH") or safety_cfg.get("safety_load_ssh") or "").strip() or None
+    prometheus_load1_query = (os.environ.get("PROMETHEUS_LOAD1_QUERY") or safety_cfg.get("prometheus_load1_query") or "").strip() or None
     # When participants run in k8s, load must come from the node (SSH to node). localhost = orchestrator, not the pods.
     # node_load1 = whole node (server stack + loadtest pods combined). We also pull stack vs loadtest pod CPU/mem separately.
     load_source = (safety_load_ssh or "localhost (orchestrator)").strip()
@@ -657,12 +927,16 @@ def _run_k8s_participants(
         else:
             next_due = step_dur  # first add at t=step_dur
             print(f"[k8s ramp-up] next +1 at t={next_due}s, then every {step_dur}s until n={max_p}.", file=sys.stderr)
-        # Start initial batch 0..min_p-1 in parallel (same as local ramp)
+        # Start initial batch: we create min_p jobs (you asked for 5). Stagger job creation so we don't hammer API.
+        # Each participant also does a startup delay (user_index * 5s) before token/connect so lk-jwt isn't hit by 5 at once.
+        INITIAL_STAGGER_SEC = 3
         for i in range(min_p):
             job_name = f"{job_prefix}{i}"
             yaml_str = _k8s_job_yaml(job_name, i, total_duration, image, namespace, image_pull_policy, node_name)
             _k8s_apply_job(yaml_str)
-        print(f"[k8s ramp-up] started {min_p} participants (parallel)", file=sys.stderr)
+            if i < min_p - 1:
+                time.sleep(INITIAL_STAGGER_SEC)
+        print(f"[k8s ramp-up] Created {min_p} jobs (min={min_p}). pods=XrYp = X running, Y pending; if X stays 1 then other jobs crashed — see results/job_logs.txt", file=sys.stderr)
         next_to_start = min_p
         load_window = collections.deque(maxlen=10)
         results_dir = load_test_dir / "results"
@@ -671,24 +945,37 @@ def _run_k8s_participants(
         stack_cpu_m = stack_mem_mi = stack_pod_n = 0
         loadtest_cpu_m = loadtest_mem_mi = loadtest_pod_n = 0
         ramp_safety_triggered = False
+        job_logs_dumped_for_early_exits = False
+        peak_running = 0
+        stuck_at_5r_dumped = False  # one-time dump when running stuck at 5 despite 6+ jobs
+        first_time_6_jobs: float | None = None  # only declare stuck after 6+ jobs for this long
+        STUCK_GRACE_AFTER_6_JOBS_SEC = 30  # give 6th+ pod time to leave ContainerCreating before dumping
         while time.monotonic() - start_time < total_duration + 5:
             elapsed = time.monotonic() - start_time
             if next_to_start < max_p:
                 due = (next_to_start - min_p + 1) * step_dur
                 if elapsed >= due:
-                    part_duration = max(10, int(total_duration - due))
-                    job_name = f"{job_prefix}{next_to_start}"
-                    yaml_str = _k8s_job_yaml(job_name, next_to_start, part_duration, image, namespace, image_pull_policy, node_name)
-                    _k8s_apply_job(yaml_str)
-                    print(f"[k8s ramp-up] +1 participant {next_to_start} (n={next_to_start + 1} total)", file=sys.stderr)
-                    next_to_start += 1
+                    try:
+                        # Each participant runs until ramp end (first started runs longest; all run in parallel).
+                        part_duration = max(10, int(total_duration - due))
+                        job_name = f"{job_prefix}{next_to_start}"
+                        print(f"[k8s ramp-up] t={elapsed:.0f}s adding participant {next_to_start} -> n={next_to_start + 1} total (runs {part_duration}s until ramp end)", file=sys.stderr)
+                        sys.stderr.flush()
+                        yaml_str = _k8s_job_yaml(job_name, next_to_start, part_duration, image, namespace, image_pull_policy, node_name)
+                        _k8s_apply_job(yaml_str)
+                        next_to_start += 1
+                        if next_to_start >= max_p:
+                            print(f"[k8s ramp-up] All {max_p} participants created; they run in parallel (first runs longest until t={total_duration}s).", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[k8s ramp-up] FAILED to add participant {next_to_start}: {e}", file=sys.stderr)
+                        next_to_start += 1  # skip so we don't retry every second
             node_mem_mb = None
             node_net_rx = node_net_tx = None
             if safety_load_ssh:
                 load1, node_mem_mb, node_net_rx, node_net_tx = get_node_stats_ssh(safety_load_ssh)
                 source = "ssh" if load1 is not None else "none"
             else:
-                load1, source = get_load1(prometheus_url, safety_load_ssh)
+                load1, source = get_load1(prometheus_url, safety_load_ssh, load1_query=prometheus_load1_query)
             server_status, server_latency_sec = get_server_latency((config.get("server_url") or "").strip())
             server_latency_ms = int(server_latency_sec * 1000) if server_latency_sec is not None else None
             local_load1 = get_load1_proc()
@@ -699,30 +986,48 @@ def _run_k8s_participants(
             jobs_created = next_to_start
             if load1 is not None:
                 load_window.append(load1)
-            # Fail immediately when there's no running pod or any job finished early (after brief grace).
-            NO_RUNNING_GRACE_SEC = 12
-            if elapsed >= NO_RUNNING_GRACE_SEC and jobs_created >= 1 and running == 0:
-                print(f"[ramp] FAIL: no RUNNING pod after {elapsed:.0f}s (jobs={jobs_created} active={active} pending={pending} succeeded={job_succeeded} failed={job_failed}). Exiting.", file=sys.stderr)
-                _k8s_dump_job_logs(namespace, job_prefix, list(range(min(5, jobs_created))), tail=80)
-                return 1
-            # Do not use active==0 alone; job status can lag. Rely on running==0 and completed+active check below.
-            # Concurrency requirement: all participants must stay running for the full ramp so we actually test N-way load.
-            # If any job finishes early (active < jobs_created), we are no longer testing concurrent load — fail immediately.
-            EARLY_EXIT_GRACE_SEC = 20
+            # Fail fast when CLIENTS never appear (0 running): 15s = no pods at all; 20s = pods didn't come up.
+            NO_RUNNING_GRACE_SEC = 20
+            job_logs_path = load_test_dir / "results" / "job_logs.txt"
+            if jobs_created >= 1 and running == 0:
+                if pending == 0 and elapsed >= 15:
+                    print(f"[ramp] FAIL: no client pods at all after 15s (jobs={jobs_created} created but 0 running, 0 pending). Exiting.", file=sys.stderr)
+                    _k8s_dump_why_no_pods(namespace, job_prefix, jobs_created, job_logs_path)
+                    _k8s_dump_job_logs(namespace, job_prefix, list(range(min(5, jobs_created))), tail=80, log_file=job_logs_path)
+                    return 1
+                if elapsed >= NO_RUNNING_GRACE_SEC:
+                    print(f"[ramp] FAIL: no RUNNING pod after {elapsed:.0f}s (CLIENTS stayed 0p; jobs={jobs_created} active={active} pending={pending}). Exiting.", file=sys.stderr)
+                    _k8s_dump_why_no_pods(namespace, job_prefix, jobs_created, job_logs_path)
+                    _k8s_dump_job_logs(namespace, job_prefix, list(range(min(5, jobs_created))), tail=80, log_file=job_logs_path)
+                    return 1
+            # If we've +1'd and we're still only 1 running, fail fast so you can iterate.
+            # (1) Fixed time: step_dur + 30s after start (first +1 at step_dur; give 30s for it to show Running).
+            # (2) After grace: we have more than min_p jobs but only 1 running and at least one job already finished → abort.
+            #    Don't check (2) in the same second we added (new pod may not be counted yet); require step_dur + 15s.
+            PLUS_ONE_GRACE_SEC = 30
+            GRACE_AFTER_ADD_SEC = 15  # give new pod time to appear in job status before failing on active < jobs_created
+            if jobs_created > min_p and running <= 1:
+                if elapsed >= step_dur + PLUS_ONE_GRACE_SEC:
+                    print(f"[ramp] FAIL: +1 participants not staying up (still {running}r, {jobs_created} jobs). Exiting. See results/job_logs.txt", file=sys.stderr)
+                    _k8s_dump_why_no_pods(namespace, job_prefix, jobs_created, job_logs_path)
+                    _k8s_dump_job_logs(namespace, job_prefix, list(range(jobs_created)), tail=150, log_file=job_logs_path)
+                    return 1
+                if elapsed >= step_dur + GRACE_AFTER_ADD_SEC and active < jobs_created:
+                    # At least one added job already finished (failed/succeeded); no point waiting.
+                    print(f"[ramp] FAIL: +1 jobs are finishing without staying up (started={jobs_created} active={active} running={running}). Exiting. See results/job_logs.txt", file=sys.stderr)
+                    _k8s_dump_why_no_pods(namespace, job_prefix, jobs_created, job_logs_path)
+                    _k8s_dump_job_logs(namespace, job_prefix, list(range(jobs_created)), tail=150, log_file=job_logs_path)
+                    return 1
+            # If some jobs finished early, warn but continue the ramp so we still get load data.
+            # Only fail when no pods are left (running==0 after grace).
             completed = job_succeeded + job_failed
-            if (
-                elapsed >= EARLY_EXIT_GRACE_SEC
-                and jobs_created >= 1
-                and completed > 0
-                and active < jobs_created
-            ):
-                print(
-                    f"[ramp] FAIL: {jobs_created - active} job(s) finished early after {elapsed:.0f}s (active={active} succeeded={job_succeeded} failed={job_failed}). "
-                    "Concurrency test requires job #1 to still be running when job #9/10 start; early exits invalidate the run.",
-                    file=sys.stderr,
-                )
-                _k8s_dump_job_logs(namespace, job_prefix, list(range(min(5, jobs_created))), tail=80)
-                return 1
+            if completed > 0 and active < jobs_created and jobs_created >= 1:
+                early_n = jobs_created - active
+                if int(elapsed) % 10 == 0 and elapsed >= 20:  # log at most every 10s to avoid spam
+                    print(
+                        f"[ramp] WARNING: {early_n} job(s) finished early (active={active} succeeded={job_succeeded} failed={job_failed}). Continuing ramp.",
+                        file=sys.stderr,
+                    )
             # Refresh pod CPU/mem every 3s so we have recent server vs client split; use cached on every tick.
             if int(elapsed) % 3 == 0:
                 stack_cpu_m, stack_mem_mi, stack_pod_n, loadtest_cpu_m, loadtest_mem_mi, loadtest_pod_n = _k8s_pod_top_split(namespace)
@@ -755,37 +1060,82 @@ def _run_k8s_participants(
                     lf.write(json.dumps(sample) + "\n")
             except OSError:
                 pass
-            # Print every second: concurrent jobs/pods proof + node load + SERVER vs CLIENT resource split on same line.
-            if load_window:
-                reported = max(load_window)
-                local_str = f" local_load1={local_load1:.2f}" if local_load1 is not None else " local_load1=n/a"
-                mem_str = f" node_mem={node_mem_mb}MB" if node_mem_mb is not None else ""
-                srv_str = f" server={server_status} {server_latency_ms}ms" if server_status is not None else ""
-                # Concurrency proof: active jobs, running pods; then server vs client resources (always on this line).
-                pod_str = f" | SERVER {stack_pod_n}p {stack_cpu_m}m {stack_mem_mi}Mi | CLIENTS {loadtest_pod_n}p {loadtest_cpu_m}m {loadtest_mem_mi}Mi"
-                print(f"[safety] t={elapsed:.0f}s concurrent: jobs_active={active} pods_running={running}r{pending}p | node_load1={reported:.2f} ({source}){local_str}{mem_str}{srv_str}{pod_str} | max={load1_max}", file=sys.stderr)
-                if active < jobs_created and jobs_created > 1:
-                    print(f"  >>> {jobs_created - active} job(s) finished early (active < jobs). Job logs dumped at end of run; or run: ./scripts/k8s-job-logs.sh {namespace} 5", file=sys.stderr)
-                # Every 5s show sample participant log (more lines so we see progress/activity).
-                if int(elapsed) % 5 == 0:
-                    sample_pod = _k8s_first_running_pod(namespace, job_prefix)
-                    if sample_pod:
-                        sample_log = _k8s_pod_log_tail(namespace, sample_pod, 6)
-                        if len(sample_log) > 140:
-                            sample_log = sample_log[:137] + "..."
+            # Print every second: concurrent jobs/pods + load (always show so we never appear "stuck" with no output).
+            reported = max(load_window) if load_window else (load1 if load1 is not None else 0.0)
+            local_str = f" local_load1={local_load1:.2f}" if local_load1 is not None else " local_load1=n/a"
+            mem_str = f" node_mem={node_mem_mb}MB" if node_mem_mb is not None else ""
+            srv_str = f" server={server_status} {server_latency_ms}ms" if server_status is not None else ""
+            # Use actual running count for CLIENTS (kubectl top lags for new pods, so loadtest_pod_n can be 0 at 1r0p).
+            pod_str = f" | SERVER {stack_pod_n}p {stack_cpu_m}m {stack_mem_mi}Mi | CLIENTS {running}p {loadtest_cpu_m}m {loadtest_mem_mi}Mi"
+            # When waiting to add next participant, show countdown on same line every second so 1r0p doesn't look stuck.
+            next_str = ""
+            if next_to_start < max_p:
+                due = (next_to_start - min_p + 1) * step_dur
+                sec_until = max(0, int(due - elapsed))
+                if sec_until > 0:
+                    next_str = f" | next+1 in {sec_until}s"
+                else:
+                    next_str = " | next+1 now"
+            # Show started vs active so it's clear we didn't "start 1 job" when 4 of 5 failed right away
+            if running > peak_running:
+                peak_running = running
+                if peak_running >= 2:
+                    print(f"[safety] peak so far: {peak_running}r (target: all {max_p} in parallel)", file=sys.stderr)
+            # Track when we first had 6+ jobs so we don't dump the instant the 6th pod is ContainerCreating.
+            if jobs_created >= 6 and first_time_6_jobs is None:
+                first_time_6_jobs = elapsed
+            # If we're stuck at 5r (or similar) despite 6+ jobs for 30s+, dump why once then interpret and stop.
+            stuck_duration = (elapsed - first_time_6_jobs) if first_time_6_jobs is not None else 0
+            if (
+                not stuck_at_5r_dumped
+                and jobs_created >= 6
+                and running <= 5
+                and elapsed >= 90
+                and stuck_duration >= STUCK_GRACE_AFTER_6_JOBS_SEC
+            ):
+                stuck_at_5r_dumped = True
+                print(f"[ramp] Running stuck at {running}r despite {jobs_created} jobs for {stuck_duration:.0f}s. Dumping WHY to results/job_logs.txt", file=sys.stderr)
+                _k8s_dump_why_no_pods(namespace, job_prefix, jobs_created, job_logs_path)
+                _k8s_dump_job_logs(namespace, job_prefix, [5, 6] if jobs_created > 6 else list(range(jobs_created)), tail=100, log_file=job_logs_path, quiet=True)
+                _k8s_interpret_stuck_pods(namespace, job_prefix)
+                print(f"[ramp] Stopping ramp; fix the cause above then re-run.", file=sys.stderr)
+                ramp_safety_triggered = True
+                break
+            jobs_str = f"started={jobs_created} active={active} ok={job_succeeded} failed={job_failed} | pods={running}r{pending}p"
+            print(f"[safety] t={elapsed:.0f}s {jobs_str} | load1={reported:.2f} ({source}){local_str}{mem_str}{srv_str}{pod_str}{next_str} max={load1_max}", file=sys.stderr)
+            if active < jobs_created and jobs_created > 1:
+                if not job_logs_dumped_for_early_exits:
+                    job_logs_dumped_for_early_exits = True
+                    # Dump in background so we don't block the loop (was blocking 30–60s and delaying +1 adds).
+                    indices_to_dump = list(range(jobs_created))
+                    log_file_path = load_test_dir / "results" / "job_logs.txt"
+                    def _dump_async():
+                        _k8s_dump_job_logs(namespace, job_prefix, indices_to_dump, tail=150, log_file=log_file_path, quiet=True)
+                    threading.Thread(target=_dump_async, daemon=True).start()
+                    print(f"  >>> {jobs_created - active} job(s) finished early. See results/job_logs.txt", file=sys.stderr)
+                    sys.stderr.flush()
+            # Every 5s show proof from each concurrent participant and one sample log line.
+            if int(elapsed) % 5 == 0:
+                proof_str = _k8s_proof_per_participant(namespace, job_prefix)
+                print(f"  proof: {proof_str}", file=sys.stderr)
+                sample_pod = _k8s_first_running_pod(namespace, job_prefix)
+                if sample_pod:
+                    sample_log = _k8s_pod_log_tail(namespace, sample_pod, 6)
+                    if len(sample_log) > 140:
+                        sample_log = sample_log[:137] + "..."
+                else:
+                    if active > 0 and running == 0:
+                        sample_log = f"(no running pod; {pending} pending - stuck?)"
+                    elif job_succeeded + job_failed > 0:
+                        sample_log = f"(no running pod; {job_succeeded} succeeded {job_failed} failed)"
                     else:
-                        if active > 0 and running == 0:
-                            sample_log = f"(no running pod; {pending} pending - stuck?)"
-                        elif job_succeeded + job_failed > 0:
-                            sample_log = f"(no running pod; {job_succeeded} succeeded {job_failed} failed)"
-                        else:
-                            sample_log = "(no running pod)"
-                    print(f"  sample_log: {sample_log}", file=sys.stderr)
-                    # Fail immediately on HTTP errors in participant logs
-                    if any(x in sample_log for x in ("HTTPError", "401", "Unauthorized", "raise_for_status", "Client Error")):
-                        print(f"[ramp] FAIL: HTTP error in participant log. Exiting.", file=sys.stderr)
-                        _k8s_dump_job_logs(namespace, job_prefix, list(range(min(5, jobs_created))), tail=80)
-                        return 1
+                        sample_log = "(no running pod)"
+                print(f"  sample_log: {sample_log}", file=sys.stderr)
+                # Fail immediately on HTTP errors in participant logs
+                if any(x in sample_log for x in ("HTTPError", "401", "Unauthorized", "raise_for_status", "Client Error")):
+                    print(f"[ramp] FAIL: HTTP error in participant log. Exiting.", file=sys.stderr)
+                    _k8s_dump_job_logs(namespace, job_prefix, list(range(min(5, jobs_created))), tail=80, log_file=load_test_dir / "results" / "job_logs.txt")
+                    return 1
             if load1 is not None and load1 > load1_max:
                 print("SAFETY TRIGGERED: load1 > max", file=sys.stderr)
                 ramp_safety_triggered = True
@@ -799,11 +1149,14 @@ def _run_k8s_participants(
             time.sleep(1)
         # Summary: load, latency, I/O (node vs local) for comparison
         _write_ramp_metrics_summary(load_samples_path, results_dir)
+        print(f"[result] Peak running during ramp: {peak_running}r (target: all {max_p} in parallel). First started runs longest until ramp end.", file=sys.stderr)
         # Ramp has a designated end: snapshot job results, dump logs if needed, then cancel jobs (don't wait 300s).
         time.sleep(5)
         statuses = _k8s_job_statuses(namespace, job_prefix)
         joined_ok = sum(1 for _, c in statuses if c == 0)
         total_started = len(statuses)
+        if peak_running < max_p and total_started >= max_p:
+            print(f"[result] Only {peak_running}r despite {max_p} jobs created — check ResourceQuota (kubectl describe resourcequota -n {namespace}) and OOMKilled.", file=sys.stderr)
         # In ramp mode we cancel jobs at the end so they never exit with 0. If we completed without
         # safety trigger and all jobs were still active (no exit code yet), treat as success.
         if not ramp_safety_triggered and total_started > 0 and all(c is None for _, c in statuses):
@@ -814,7 +1167,7 @@ def _run_k8s_participants(
             json.dump({"joined": joined_ok, "total": total_started, "success_rate_pct": (100.0 * joined_ok / total_started) if total_started else 0}, f)
         if joined_ok < total_started and total_started > 0:
             print(f"[result] {joined_ok}/{total_started} succeeded at ramp end. Job logs:", file=sys.stderr)
-            _k8s_dump_job_logs(namespace, job_prefix, list(range(total_started)), tail=100)
+            _k8s_dump_job_logs(namespace, job_prefix, list(range(total_started)), tail=100, log_file=load_test_dir / "results" / "job_logs.txt")
         _k8s_delete_jobs(namespace, job_prefix)
         # Skip the long wait block below; we already have result and deleted jobs.
         ramp_done_result = (joined_ok, total_started)
@@ -840,7 +1193,7 @@ def _run_k8s_participants(
             json.dump({"joined": joined_ok, "total": total_started, "success_rate_pct": (100.0 * joined_ok / total_started) if total_started else 0}, f)
         if joined_ok < total_started and total_started > 0:
             print(f"[result] {joined_ok}/{total_started} participants succeeded. Dumping job logs.", file=sys.stderr)
-            _k8s_dump_job_logs(namespace, job_prefix, list(range(total_started)), tail=100)
+            _k8s_dump_job_logs(namespace, job_prefix, list(range(total_started)), tail=100, log_file=load_test_dir / "results" / "job_logs.txt")
 
     if we_created_users:
         subprocess.call(
@@ -895,6 +1248,7 @@ def main() -> int:
     consecutive_errors_max = safety_cfg.get("consecutive_errors_max", 5)
     prometheus_url = (os.environ.get("PROMETHEUS_URL") or safety_cfg.get("prometheus_url") or "").strip()
     safety_load_ssh = (os.environ.get("SAFETY_LOAD_SSH") or safety_cfg.get("safety_load_ssh") or "").strip() or None
+    prometheus_load1_query = (os.environ.get("PROMETHEUS_LOAD1_QUERY") or safety_cfg.get("prometheus_load1_query") or "").strip() or None
     users_file = config.get("test_users_file", "test_users.json")
     script_dir = Path(__file__).resolve().parent
     load_test_dir = script_dir.parent
@@ -1018,7 +1372,7 @@ def main() -> int:
                     print(f"[ramp-up] +1 participant {next_to_start} (n={next_to_start + 1} total)", file=sys.stderr)
                     next_to_start += 1
 
-            load1, source = get_load1(prometheus_url, safety_load_ssh)
+            load1, source = get_load1(prometheus_url, safety_load_ssh, load1_query=prometheus_load1_query)
             server_status, server_latency_sec = get_server_latency((config.get("server_url") or "").strip())
             server_latency_ms = int(server_latency_sec * 1000) if server_latency_sec is not None else None
             local_load1 = get_load1_proc()
@@ -1087,7 +1441,7 @@ def main() -> int:
                 safety_triggered = True
                 print("SAFETY TRIGGERED (file present)", file=sys.stderr)
                 break
-            load1, source = get_load1(prometheus_url, safety_load_ssh)
+            load1, source = get_load1(prometheus_url, safety_load_ssh, load1_query=prometheus_load1_query)
             if load1 is not None:
                 if loop_count % 5 == 0:
                     print(f"[safety] load1={load1:.2f} (source={source}, max={load1_max})", file=sys.stderr)
@@ -1130,6 +1484,7 @@ def main() -> int:
     total_started = len(procs)
     with open(result_path, "w") as f:
         json.dump({"joined": joined_ok, "total": total_started, "success_rate_pct": (100.0 * joined_ok / total_started) if total_started else 0}, f)
+    _write_participant_metrics_summary(load_test_dir)
 
     # Remove (deactivate) test users if we created them this run
     if we_created_users:

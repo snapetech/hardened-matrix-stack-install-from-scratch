@@ -85,6 +85,12 @@ def _post_with_429_retry_counted(url: str, *, headers=None, json_data=None, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_media import SAMPLES_PER_FRAME, SAMPLE_RATE, sine_audio_frames, video_frames
 
+# Load-test A/V: 480p @ 24fps — stable under k8s; one bad frame won't kill the job
+VIDEO_WIDTH = 854
+VIDEO_HEIGHT = 480
+VIDEO_FPS = 24
+NUM_AUDIO_CHANNELS = 1
+
 # LiveKit SDK
 try:
     from livekit import rtc
@@ -216,9 +222,12 @@ async def run_participant(
     duration_seconds: float,
     safety_triggered: callable,
     metrics_list: list | None = None,
+    startup_delay_sec: float = 0,
 ) -> None:
     if rtc is None:
         raise RuntimeError("livekit package not installed")
+    if startup_delay_sec > 0:
+        await asyncio.sleep(startup_delay_sec)
 
     # 1) Join Matrix room (accept invite)
     matrix_join_room(server_url, access_token, room_id, metrics_list)
@@ -233,7 +242,7 @@ async def run_participant(
     member_id = f"loadtest-{user_id}"
     lk_token = get_livekit_token(livekit_jwt_url, openid_resp, room_id, user_id, server_name, device_id, member_id, metrics_list)
 
-    # 4) Connect to LiveKit
+    # 4) Connect to LiveKit (SDK defaults to auto_subscribe; no RoomOptions here — Room() takes loop, not options)
     room = rtc.Room()
     t0_connect = time.perf_counter()
     try:
@@ -245,10 +254,10 @@ async def run_participant(
     if metrics_list is not None:
         metrics_list.append({"op": "livekit_connect", "status": 0, "latency_ms": round((time.perf_counter() - t0_connect) * 1000, 2)})
 
-    # 5) Create sources and tracks
-    audio_source = rtc.AudioSource(SAMPLE_RATE, 1)
+    # 5) Create sources and tracks (480p 24fps — stable, still real load)
+    audio_source = rtc.AudioSource(SAMPLE_RATE, NUM_AUDIO_CHANNELS)
     audio_track = rtc.LocalAudioTrack.create_audio_track("sine", audio_source)
-    video_source = rtc.VideoSource(320, 240)
+    video_source = rtc.VideoSource(VIDEO_WIDTH, VIDEO_HEIGHT)
     video_track = rtc.LocalVideoTrack.create_video_track("pattern", video_source)
 
     options = rtc.TrackPublishOptions()
@@ -293,6 +302,16 @@ async def run_participant(
     elif room.remote_participants and metrics_list is not None:
         metrics_list.append({"op": "rx_validation", "passed": True, "elapsed_s": round(elapsed, 1)})
 
+    # 5c) Snapshot of remote state for summary (participant count + tracks actually attached)
+    remote_count = len(room.remote_participants)
+    tracks_attached = 0
+    for remote in room.remote_participants.values():
+        for pub in remote.track_publications.values():
+            if getattr(pub, "track", None) is not None:
+                tracks_attached += 1
+    if metrics_list is not None:
+        metrics_list.append({"op": "lk_remote_snapshot", "remote_participant_count": remote_count, "remote_tracks_attached": tracks_attached})
+
     # 6) Matrix text: one sentence every 15s (run sync HTTP in executor)
     message_index = [0]  # mutable so closure can update
     record_first_send = [True]  # record latency/429 for first send only
@@ -311,7 +330,6 @@ async def run_participant(
         loop = asyncio.get_event_loop()
         while not safety_triggered():
             await loop.run_in_executor(None, send_one_message)
-            # One line per 15s so harness sample_log shows activity (A/V + Matrix).
             t_sec = message_index[0] * 15
             print(f"progress t={t_sec}s A/V+Matrix", file=sys.stderr)
             for _ in range(150):  # 15s in 0.1s steps so we can check safety
@@ -319,29 +337,50 @@ async def run_participant(
                     return
                 await asyncio.sleep(0.1)
 
-    text_task = asyncio.create_task(text_loop())
+    # Frame counters for proof logging (all participants doing real A/V)
+    video_frame_count = [0]  # mutable
+    audio_frame_count = [0]
 
-    # 7) Push synthetic audio in a loop (async)
-    async def push_audio():
-        for chunk in sine_audio_frames():
+    async def proof_loop():
+        """Every 15s log cumulative video/audio frames sent — proves constant A/V load (so ramp sees proof from each pod sooner)."""
+        while not safety_triggered():
+            await asyncio.sleep(15.0)
             if safety_triggered():
                 return
-            frame = rtc.AudioFrame(chunk, SAMPLE_RATE, 1, SAMPLES_PER_FRAME)
-            await audio_source.capture_frame(frame)
-            await asyncio.sleep(0.02)  # ~20ms
+            v, a = video_frame_count[0], audio_frame_count[0]
+            print(f"proof: sent {v} video frames, {a} audio frames (480p24 continuous)", file=sys.stderr)
+            sys.stderr.flush()
 
-    # 8) Push synthetic video in a loop (sync capture_frame)
+    text_task = asyncio.create_task(text_loop())
+    proof_task = asyncio.create_task(proof_loop())
+
+    # 7) Push synthetic audio — constant 20ms frames; one bad frame must not kill the job
+    async def push_audio():
+        for chunk in sine_audio_frames(amplitude=0.5):
+            if safety_triggered():
+                return
+            try:
+                frame = rtc.AudioFrame(chunk, SAMPLE_RATE, NUM_AUDIO_CHANNELS, SAMPLES_PER_FRAME)
+                await audio_source.capture_frame(frame)
+                audio_frame_count[0] += 1
+            except Exception as e:
+                print(f"push_audio: {e}", file=sys.stderr)
+            await asyncio.sleep(0.02)  # 20ms = 50 frames/s constant
+
+    # 8) Push synthetic video — constant fps; one bad frame must not kill the job
     def push_video():
         import time as _t
         start = _t.monotonic()
-        for raw in video_frames(320, 240, 15):
+        for raw in video_frames(VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS):
             if safety_triggered():
                 return
-            # VideoFrame(width, height, type, data) - type RGB24
-            frame = rtc.VideoFrame(320, 240, rtc.VideoBufferType.RGB24, raw)
-            ts_us = int((_t.monotonic() - start) * 1_000_000)
-            video_source.capture_frame(frame, timestamp_us=ts_us)
-            _t.sleep(1.0 / 15)
+            try:
+                frame = rtc.VideoFrame(VIDEO_WIDTH, VIDEO_HEIGHT, rtc.VideoBufferType.RGB24, raw)
+                ts_us = int((_t.monotonic() - start) * 1_000_000)
+                video_source.capture_frame(frame, timestamp_us=ts_us)
+                video_frame_count[0] += 1
+            except Exception as e:
+                print(f"push_video: {e}", file=sys.stderr)
 
     async def run_video_loop():
         loop = asyncio.get_event_loop()
@@ -354,13 +393,19 @@ async def run_participant(
         await asyncio.sleep(duration_seconds)
     finally:
         text_task.cancel()
+        proof_task.cancel()
         audio_task.cancel()
         video_task.cancel()
-        for t in (text_task, audio_task, video_task):
+        for t in (text_task, proof_task, audio_task, video_task):
             try:
                 await t
             except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                print(f"task exit: {e}", file=sys.stderr)
+        v, a = video_frame_count[0], audio_frame_count[0]
+        print(f"proof: total {v} video frames, {a} audio frames", file=sys.stderr)
+        sys.stderr.flush()
         await room.disconnect()
 
 
@@ -406,6 +451,8 @@ def main() -> int:
     metrics_list = [] if metrics_dir else None
 
     try:
+        # Spread token/connect load: participant 0 starts immediately, 1 waits 5s, 2 waits 10s, etc.
+        startup_delay = float(args.user_index * 5)
         asyncio.run(run_participant(
             server_url=server_url,
             server_name=server_name,
@@ -417,6 +464,7 @@ def main() -> int:
             duration_seconds=args.duration,
             safety_triggered=safety_triggered,
             metrics_list=metrics_list,
+            startup_delay_sec=startup_delay,
         ))
     finally:
         if metrics_dir and metrics_list is not None:

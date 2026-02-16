@@ -8,6 +8,8 @@ MAX="${2:-5}"
 PREFIX="loadtest-p-"
 for i in $(seq 0 $((MAX - 1))); do
   echo "--- job ${PREFIX}${i} ---"
-  kubectl logs -n "$NAMESPACE" "job/${PREFIX}${i}" --tail=100 2>/dev/null || echo "(no logs or job not found)"
+  if ! kubectl logs -n "$NAMESPACE" "job/${PREFIX}${i}" --tail=100 --all-containers=true 2>&1; then
+    echo "(no logs or job not found; check: kubectl get jobs -n $NAMESPACE)"
+  fi
   echo
 done

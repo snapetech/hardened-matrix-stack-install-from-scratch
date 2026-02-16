@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build participant image and run ramp with participants in k8s (no port-forward).
-# Prereqs: KUBECONFIG set, test_users.json and test_room_id.txt in load-test/ (run create_test_users once).
+# Prereqs: kubectl must work (script will try to fix KUBECONFIG if needed). test_users.json and test_room_id.txt in load-test/.
 # Usage: ./run-ramp-k8s.sh [ramp_harness.py args...]
 # Example: ./run-ramp-k8s.sh --config config-ramp-qa.yaml --min 2 --max 10 --single-pass --skip-tier2
 # For minikube: MINIKUBE_DOCKER=1 ./run-ramp-k8s.sh ...
@@ -8,6 +8,26 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# Ensure kubectl can run: use KUBECONFIG if set and readable, else ~/.kube/config, else copy k3s config into repo.
+_kubeconfig_ok() { [ -n "${1:-}" ] && [ -r "$1" ]; }
+if ! _kubeconfig_ok "$KUBECONFIG"; then
+  if _kubeconfig_ok "$HOME/.kube/config"; then
+    export KUBECONFIG="$HOME/.kube/config"
+  elif [ -r /etc/rancher/k3s/k3s.yaml ] 2>/dev/null; then
+    export KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+  elif [ -f /etc/rancher/k3s/k3s.yaml ] 2>/dev/null; then
+    mkdir -p "$SCRIPT_DIR/.kube"
+    if sudo cat /etc/rancher/k3s/k3s.yaml > "$SCRIPT_DIR/.kube/config" 2>/dev/null; then
+      chmod 600 "$SCRIPT_DIR/.kube/config"
+      export KUBECONFIG="$SCRIPT_DIR/.kube/config"
+    fi
+  fi
+fi
+if ! kubectl cluster-info >/dev/null 2>&1; then
+  echo "kubectl cannot reach cluster. Set KUBECONFIG to a readable kubeconfig (e.g. copy from the k3s node)." >&2
+  exit 1
+fi
 
 if [ ! -f test_users.json ] || [ ! -f test_room_id.txt ]; then
   echo "Missing test_users.json or test_room_id.txt. Create users and room first, e.g.:" >&2
@@ -53,6 +73,7 @@ if [ -n "$NODE" ] && [ "$NODE" != "localhost" ]; then
 fi
 
 export TEST_ROOM_ID="$(cat test_room_id.txt)"
+export PYTHONUNBUFFERED=1
 VENV_PY="$SCRIPT_DIR/.venv/bin/python3"
 [ -x "$VENV_PY" ] || { echo "Create venv: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"; exit 1; }
 
@@ -101,6 +122,9 @@ if [ -d "$K8S_QA_DIR" ]; then
     [ "$MAX_PARTICIPANTS" -lt 1 ] 2>/dev/null && MAX_PARTICIPANTS=1
     [ "$MAX_PARTICIPANTS" -gt 20 ] 2>/dev/null && MAX_PARTICIPANTS=20
     echo "[stack] Quota OK (used ${USED}m / ${LIMIT}m, ${HEADROOM}m headroom). Max participants from quota: $MAX_PARTICIPANTS (${CPU_PER_PART}m each + ${BUFFER}m buffer)." >&2
+    MEM_USED=$(kubectl get resourcequota matrix-qa-quota -n "$NS" -o jsonpath='{.status.used.limits\.memory}' 2>/dev/null || echo "")
+    MEM_LIMIT=$(kubectl get resourcequota matrix-qa-quota -n "$NS" -o jsonpath='{.status.hard.limits\.memory}' 2>/dev/null || echo "")
+    [ -n "$MEM_LIMIT" ] && echo "[stack] Memory quota: used=$MEM_USED limit=$MEM_LIMIT (need ~8Gi for 10 participants + stack; if stuck at 5r, check this)." >&2
   fi
   # 1) Create nginx TLS secret if missing
   if ! kubectl get secret nginx-tls-qa -n "$NS" >/dev/null 2>&1; then
@@ -141,41 +165,47 @@ if [ -d "$K8S_QA_DIR" ]; then
       exit 1
     fi
   fi
-  # 3) Point lk-jwt at nginx ClusterIP and restart lk-jwt
+  # 3) Point lk-jwt at nginx ClusterIP. Patching triggers a rollout only if the spec actually changes.
   NGINX_IP=$(kubectl get svc nginx -n "$NS" -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
   if [ -n "$NGINX_IP" ] && kubectl get deployment lk-jwt -n "$NS" >/dev/null 2>&1; then
-    echo "[stack] Patching lk-jwt hostAliases to nginx $NGINX_IP ..." >&2
-    kubectl patch deployment lk-jwt -n "$NS" --type=json \
-      -p='[{"op":"replace","path":"/spec/template/spec/hostAliases","value":[{"ip":"'"$NGINX_IP"'","hostnames":["qa.local"]}]}]' || true
-  fi
-  if kubectl get deployment lk-jwt -n "$NS" >/dev/null 2>&1; then
-    echo "[stack] Restarting lk-jwt (timeout ${ROLLOUT_TIMEOUT}s) ..." >&2
-    kubectl rollout restart deployment/lk-jwt -n "$NS" || true
-    if ! kubectl rollout status deployment/lk-jwt -n "$NS" --timeout="${ROLLOUT_TIMEOUT}s" 2>&1; then
-      dump_deployment_logs lk-jwt
-      echo "ERROR: lk-jwt rollout did not complete. See dump above." >&2
-      exit 1
+    PATCH_OUT=$(kubectl patch deployment lk-jwt -n "$NS" --type=json \
+      -p='[{"op":"replace","path":"/spec/template/spec/hostAliases","value":[{"ip":"'"$NGINX_IP"'","hostnames":["qa.local"]}]}]' 2>&1) || true
+    if echo "$PATCH_OUT" | grep -q "unchanged\|no change"; then
+      echo "[stack] lk-jwt hostAliases already point to nginx $NGINX_IP; no rollout." >&2
+    else
+      echo "[stack] Patching lk-jwt hostAliases to nginx $NGINX_IP; waiting for rollout (${ROLLOUT_TIMEOUT}s) ..." >&2
+      if ! kubectl rollout status deployment/lk-jwt -n "$NS" --timeout="${ROLLOUT_TIMEOUT}s" 2>&1; then
+        dump_deployment_logs lk-jwt
+        echo "ERROR: lk-jwt rollout did not complete after patch. See dump above." >&2
+        exit 1
+      fi
     fi
   fi
-  # Verify nginx is reachable from inside cluster before starting jobs (avoids connection refused).
+  # Verify nginx is reachable from inside cluster (curl from a pod). If check pod fails/timeout, accept nginx Ready + endpoints.
   echo "[stack] Checking nginx reachable from cluster ..." >&2
   NGINX_URL="http://nginx.${NS}.svc/"
   kubectl run nginx-ready-check --restart=Never -n "$NS" --image=curlimages/curl:latest --overrides='{"spec":{"containers":[{"name":"curl","image":"curlimages/curl:latest","command":["curl","-sf","--max-time","10","'"$NGINX_URL"'"]}]}}' 2>/dev/null || true
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  PHASE=""
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
     PHASE=$(kubectl get pod nginx-ready-check -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
     [ "$PHASE" = "Succeeded" ] && break
     [ "$PHASE" = "Failed" ] && break
     sleep 1
   done
-  PHASE=$(kubectl get pod nginx-ready-check -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
   kubectl delete pod nginx-ready-check -n "$NS" --ignore-not-found=true 2>/dev/null || true
   if [ "$PHASE" != "Succeeded" ]; then
-    echo "ERROR: nginx not reachable from cluster ($NGINX_URL). Pod phase=$PHASE." >&2
-    echo "  kubectl get pods -n $NS -l app=nginx; kubectl get endpoints nginx -n $NS" >&2
-    kubectl get pods -n "$NS" -l app=nginx -o wide 2>&1 | sed 's/^/  /' >&2
-    kubectl get endpoints nginx -n "$NS" 2>&1 | sed 's/^/  /' >&2
-    dump_deployment_logs nginx
-    exit 1
+    NGINX_READY_NOW=$(kubectl get pods -n "$NS" -l app=nginx -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+    HAS_ENDPOINTS=$(kubectl get endpoints nginx -n "$NS" -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null | wc -c)
+    if [ "$NGINX_READY_NOW" = "True" ] && [ "$HAS_ENDPOINTS" -gt 1 ] 2>/dev/null; then
+      echo "[stack] nginx-ready-check pod phase=$PHASE (skip); nginx pod Ready and endpoints present, continuing." >&2
+    else
+      echo "ERROR: nginx not reachable from cluster ($NGINX_URL). Pod phase=$PHASE." >&2
+      echo "  kubectl get pods -n $NS -l app=nginx; kubectl get endpoints nginx -n $NS" >&2
+      kubectl get pods -n "$NS" -l app=nginx -o wide 2>&1 | sed 's/^/  /' >&2
+      kubectl get endpoints nginx -n "$NS" 2>&1 | sed 's/^/  /' >&2
+      dump_deployment_logs nginx
+      exit 1
+    fi
   fi
   echo "[stack] Ready." >&2
 fi
@@ -191,12 +221,17 @@ if [ "$MAX_PARTICIPANTS" -gt 0 ] 2>/dev/null && [ $# -eq 0 ]; then
   AUTO_MAX=1
   echo "[ramp] Using quota-derived max: $MAX_PARTICIPANTS participants (no args given)." >&2
 fi
-"$VENV_PY" scripts/ramp_harness.py --k8s-participants --namespace matrix-qa "${EXTRA_ARGS[@]}" "$@"
-RC=$?
+# Tee to a log file so you can 'see logs' when something doesn't work.
+mkdir -p "$SCRIPT_DIR/results"
+RAMP_LOG="${RAMP_LOG:-$SCRIPT_DIR/results/ramp.log}"
+echo "[ramp] Log file: $RAMP_LOG" >&2
+"$VENV_PY" scripts/ramp_harness.py --k8s-participants --namespace matrix-qa "${EXTRA_ARGS[@]}" "$@" 2>&1 | tee "$RAMP_LOG"
+RC=${PIPESTATUS[0]}
 if [ $RC -ne 0 ] && [ "$AUTO_MAX" -eq 1 ] && [ "$MAX_PARTICIPANTS" -gt 1 ] 2>/dev/null; then
   NEXT_MAX=$((MAX_PARTICIPANTS - 1))
-  echo "[ramp] Run failed (exit $RC). Retrying with max=$NEXT_MAX." >&2
-  "$VENV_PY" scripts/ramp_harness.py --k8s-participants --namespace matrix-qa "${EXTRA_ARGS[@]}" --config config-ramp-qa.yaml --min 1 --max "$NEXT_MAX" --single-pass --skip-tier2
-  RC=$?
+  echo "[ramp] Run failed (exit $RC). Retrying with max=$NEXT_MAX." >> "$RAMP_LOG" 2>&1
+  "$VENV_PY" scripts/ramp_harness.py --k8s-participants --namespace matrix-qa "${EXTRA_ARGS[@]}" --config config-ramp-qa.yaml --min 1 --max "$NEXT_MAX" --single-pass --skip-tier2 2>&1 | tee -a "$RAMP_LOG"
+  RC=${PIPESTATUS[0]}
 fi
+echo "[ramp] Exit code: $RC. Full log: $RAMP_LOG" >&2
 exit $RC

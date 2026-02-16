@@ -224,6 +224,16 @@ def main() -> int:
         # Single run: ramp up from min to max (add participants over time), one metrics stream
         step_duration = max(getattr(args, "step_duration_min", 20), args.tier1_duration // (args.max - args.min + 1))
         total_duration_approx = (args.max - args.min + 1) * step_duration
+        # Warn if duration is too short to actually reach max (ramp time ≈ (max - min) * step_duration)
+        ramp_time_to_reach_max = (args.max - args.min) * step_duration
+        if args.tier1_duration < ramp_time_to_reach_max:
+            estimated_peak = min(args.max, args.min + int(args.tier1_duration / step_duration))
+            print(
+                f"\n*** WARNING: tier1-duration ({args.tier1_duration}s) is shorter than ramp time to --max ({ramp_time_to_reach_max}s). "
+                f"You will not reach {args.max} participants; estimated peak ≈ {estimated_peak}. "
+                f"Increase --tier1-duration or decrease --step-duration-min. ***\n",
+                file=sys.stderr,
+            )
         print(f"\n--- Single-pass ramp {args.min} -> {args.max} (step={step_duration}s, ~{total_duration_approx}s total) ---", file=sys.stderr)
         metrics_path = results_dir / "metrics_ramp.jsonl"
         if metrics_path.exists():
