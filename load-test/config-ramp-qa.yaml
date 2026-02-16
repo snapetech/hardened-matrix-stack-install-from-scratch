@@ -8,9 +8,15 @@ livekit_jwt_url: "http://localhost:30050"
 test_users_file: "test_users.json"
 participants: 10
 duration_seconds: 120
+# Video resolution: "480p" (854x480 @ 24fps) or "1080p" (1920x1080 @ 24fps). Affects CPU/load per participant.
+video_resolution: "1080p"
 safety:
-  load1_max: 20
+  load1_max: 35
   consecutive_errors_max: 10
-  # Server load via SSH /proc/loadavg (no Prometheus). Must be the k8s node where participant pods run.
-  # Use hostname if SSH works (e.g. in ~/.ssh/config), or user@hostname / user@node-ip. Override with SAFETY_LOAD_SSH env.
+  # Three loads: orchestrator_host (machine running this harness / general system), client_node (node where QA client pods run), stack_node (Synapse/QA server host).
+  # safety_load_ssh = node where loadtest PODS run (SSH for /proc/loadavg) → reported as client_node.
   safety_load_ssh: "kspld0"
+  # stack_load_ssh = node where Synapse/QA server runs. When set, we SSH there for stack_node. When unset, use stack_on_orchestrator.
+  # stack_load_ssh: "other-node"
+  # stack_on_orchestrator: true = Synapse runs on same host as the harness; stack_node is then the same as orchestrator_host.
+  stack_on_orchestrator: true

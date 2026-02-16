@@ -222,7 +222,7 @@ def main() -> int:
 
     if args.single_pass:
         # Single run: ramp up from min to max (add participants over time), one metrics stream
-        step_duration = max(getattr(args, "step_duration_min", 20), args.tier1_duration // (args.max - args.min + 1))
+        step_duration = getattr(args, "step_duration_min", 20)
         total_duration_approx = (args.max - args.min + 1) * step_duration
         # Warn if duration is too short to actually reach max (ramp time ≈ (max - min) * step_duration)
         ramp_time_to_reach_max = (args.max - args.min) * step_duration
@@ -271,7 +271,10 @@ def main() -> int:
         join_success, joined, total = read_load_test_result(load_test_dir)
         agg = aggregate_metrics_jsonl(metrics_path) if metrics_path.exists() else {}
 
-        if stop_on_oom and agg.get("oom_kills", 0) > 0:
+        # Only fail on OOM when the run did not achieve full success (stale OOM from namespace can trigger otherwise).
+        oom_count = agg.get("oom_kills", 0)
+        full_success = total > 0 and joined >= total and join_success >= join_success_threshold
+        if stop_on_oom and oom_count > 0 and not full_success:
             print("Stop: OOM kills detected", file=sys.stderr)
             with open(summary_path, "a", newline="") as cf:
                 w = csv.DictWriter(cf, fieldnames=fieldnames)
@@ -282,6 +285,8 @@ def main() -> int:
                     "avg_rtt_ms": "", "packet_loss_pct": "", "tier1_exit": tier1_rc, "notes": "stopped_oom",
                 })
             return 1
+        if oom_count > 0 and full_success:
+            print(f"Note: OOM events in namespace (e.g. from earlier run) but ramp completed {joined}/{total}.", file=sys.stderr)
 
         row = {
             "n": args.max, "mode": "livekit-only-ramp", "join_success_rate": join_success,

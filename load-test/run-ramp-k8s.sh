@@ -55,6 +55,11 @@ except Exception:
     print('')
 " 2>/dev/null || true)
 fi
+# Never use timeways.net for preload or load — k8s-qa node only.
+if [ -n "$NODE" ] && echo "$NODE" | grep -qi timeways; then
+  echo "[ramp] Ignoring preload target containing timeways (use k8s-qa node only)." >&2
+  NODE=""
+fi
 if [ -n "$NODE" ] && [ "$NODE" != "localhost" ]; then
   echo "Preloading image on $NODE (k3s containerd so kubelet can use it, no registry) ..." >&2
   # k3s uses its own containerd; must use 'k3s ctr images import', not system ctr
@@ -78,7 +83,7 @@ VENV_PY="$SCRIPT_DIR/.venv/bin/python3"
 [ -x "$VENV_PY" ] || { echo "Create venv: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"; exit 1; }
 
 # --- Ensure stack is ready so lk-jwt can validate OpenID ---
-# Quota: compute max participants from headroom (100m each + 100m buffer). Run that max, or max-1 on failure.
+# Quota: compute max participants from headroom (2000m limit each + 500m buffer). Run that max, or max-1 on failure.
 NS="${LOADTEST_K8S_NAMESPACE:-matrix-qa}"
 K8S_QA_DIR="${K8S_QA_DIR:-$SCRIPT_DIR/../k8s-qa}"
 ROLLOUT_TIMEOUT="${LOADTEST_ROLLOUT_TIMEOUT:-45}"
@@ -102,10 +107,9 @@ if [ -d "$K8S_QA_DIR" ]; then
   if [ -f "$K8S_QA_DIR/00-budget.yaml" ]; then
     kubectl apply -f "$K8S_QA_DIR/00-budget.yaml" -n "$NS" 2>/dev/null || true
   fi
-  # 0b) Quota: normalize to millicores (API may return "5000m" or "5" cores). Per-participant = 100m (LimitRange default).
-  # Compute max participants we can run, or fail fast if not enough for 1.
-  CPU_PER_PART=100
-  BUFFER=100
+  # 0b) Quota: per-participant limit 2000m (2c); headroom/2000 = max participants. No CPU cap so load test can drive load.
+  CPU_PER_PART=2000
+  BUFFER=500
   MAX_PARTICIPANTS=1
   if kubectl get resourcequota matrix-qa-quota -n "$NS" >/dev/null 2>&1; then
     RAW_USED=$(kubectl get resourcequota matrix-qa-quota -n "$NS" -o jsonpath='{.status.used.limits\.cpu}' 2>/dev/null || echo 0)
@@ -165,26 +169,42 @@ if [ -d "$K8S_QA_DIR" ]; then
       exit 1
     fi
   fi
-  # 3) Point lk-jwt at nginx ClusterIP. Patching triggers a rollout only if the spec actually changes.
+  # 3) Point lk-jwt at nginx ClusterIP. Always patch so hostAliases match current nginx; then rollout.
   NGINX_IP=$(kubectl get svc nginx -n "$NS" -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
   if [ -n "$NGINX_IP" ] && kubectl get deployment lk-jwt -n "$NS" >/dev/null 2>&1; then
-    PATCH_OUT=$(kubectl patch deployment lk-jwt -n "$NS" --type=json \
-      -p='[{"op":"replace","path":"/spec/template/spec/hostAliases","value":[{"ip":"'"$NGINX_IP"'","hostnames":["qa.local"]}]}]' 2>&1) || true
-    if echo "$PATCH_OUT" | grep -q "unchanged\|no change"; then
-      echo "[stack] lk-jwt hostAliases already point to nginx $NGINX_IP; no rollout." >&2
+    echo "[stack] Patching lk-jwt hostAliases to nginx $NGINX_IP ..." >&2
+    kubectl patch deployment lk-jwt -n "$NS" --type=json \
+      -p='[{"op":"replace","path":"/spec/template/spec/hostAliases","value":[{"ip":"'"$NGINX_IP"'","hostnames":["qa.local"]}]}]' 2>/dev/null || true
+    echo "[stack] Waiting for lk-jwt rollout (${ROLLOUT_TIMEOUT}s) ..." >&2
+    if ! kubectl rollout status deployment/lk-jwt -n "$NS" --timeout="${ROLLOUT_TIMEOUT}s" 2>&1; then
+      dump_deployment_logs lk-jwt
+      echo "ERROR: lk-jwt rollout did not complete. See dump above." >&2
+      exit 1
+    fi
+    # 3b) Pre-ramp: verify OpenID path is reachable (same path lk-jwt uses). Pod with same hostAliases as lk-jwt.
+    echo "[stack] Verifying OpenID reachability (https://qa.local:8448) from cluster ..." >&2
+    OPENID_CHECK=$(kubectl run openid-check --restart=Never -n "$NS" --image=curlimages/curl:latest --overrides='{"spec":{"hostAliases":[{"ip":"'"$NGINX_IP"'","hostnames":["qa.local"]}],"containers":[{"name":"curl","image":"curlimages/curl:latest","command":["sh","-c","curl -sk --max-time 10 https://qa.local:8448/.well-known/matrix/server -o /dev/null -w \"%{http_code}\" && echo && curl -sk --max-time 10 -H \"Authorization: Bearer invalid\" https://qa.local:8448/_matrix/federation/v1/openid/userinfo -o /dev/null -w \"%{http_code}\""]}]}}' 2>&1) || true
+    sleep 2
+    OPENID_OUT=""
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      OPENID_OUT=$(kubectl logs openid-check -n "$NS" 2>/dev/null) || true
+      [ -n "$OPENID_OUT" ] && break
+      sleep 1
+    done
+    kubectl delete pod openid-check -n "$NS" --ignore-not-found=true 2>/dev/null || true
+    # Expect: 200 for .well-known, 401 for userinfo with invalid token
+    if echo "$OPENID_OUT" | grep -q "200" && echo "$OPENID_OUT" | grep -q "401"; then
+      echo "[stack] OpenID reachability OK (well-known=200, userinfo with bad token=401)." >&2
     else
-      echo "[stack] Patching lk-jwt hostAliases to nginx $NGINX_IP; waiting for rollout (${ROLLOUT_TIMEOUT}s) ..." >&2
-      if ! kubectl rollout status deployment/lk-jwt -n "$NS" --timeout="${ROLLOUT_TIMEOUT}s" 2>&1; then
-        dump_deployment_logs lk-jwt
-        echo "ERROR: lk-jwt rollout did not complete after patch. See dump above." >&2
-        exit 1
-      fi
+      echo "ERROR: OpenID check failed. Output: $OPENID_OUT (expect 200 and 401). Fix nginx/lk-jwt and qa.local resolution." >&2
+      exit 1
     fi
   fi
-  # Verify nginx is reachable from inside cluster (curl from a pod). If check pod fails/timeout, accept nginx Ready + endpoints.
+  # Verify nginx is reachable from inside cluster and .well-known (for lk-jwt OpenID) returns 200.
   echo "[stack] Checking nginx reachable from cluster ..." >&2
   NGINX_URL="http://nginx.${NS}.svc/"
-  kubectl run nginx-ready-check --restart=Never -n "$NS" --image=curlimages/curl:latest --overrides='{"spec":{"containers":[{"name":"curl","image":"curlimages/curl:latest","command":["curl","-sf","--max-time","10","'"$NGINX_URL"'"]}]}}' 2>/dev/null || true
+  WELLKNOWN_URL="http://nginx.${NS}.svc/.well-known/matrix/server"
+  kubectl run nginx-ready-check --restart=Never -n "$NS" --image=curlimages/curl:latest --overrides='{"spec":{"containers":[{"name":"curl","image":"curlimages/curl:latest","command":["sh","-c","curl -sf --max-time 10 \"'"$NGINX_URL"'\" && curl -sf --max-time 10 \"'"$WELLKNOWN_URL"'\""]}]}}' 2>/dev/null || true
   PHASE=""
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
     PHASE=$(kubectl get pod nginx-ready-check -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
@@ -220,6 +240,25 @@ if [ "$MAX_PARTICIPANTS" -gt 0 ] 2>/dev/null && [ $# -eq 0 ]; then
   set -- --config config-ramp-qa.yaml --min 1 --max "$MAX_PARTICIPANTS" --single-pass --skip-tier2
   AUTO_MAX=1
   echo "[ramp] Using quota-derived max: $MAX_PARTICIPANTS participants (no args given)." >&2
+fi
+# Load for safety MUST come from the k8s-qa node (where pods run). Never use timeways.net / prod.
+# Force SAFETY_LOAD_SSH from the ramp config so we never pick up timeways from .env.
+RAMP_CONFIG=config-ramp-qa.yaml
+K8S_LOAD_NODE=$("$VENV_PY" -c "
+import yaml
+try:
+    c = yaml.safe_load(open('$RAMP_CONFIG'))
+    n = (c.get('safety') or {}).get('safety_load_ssh') or ''
+    print(n.strip() if n else '')
+except Exception:
+    print('')
+" 2>/dev/null || true)
+if [[ -n "$K8S_LOAD_NODE" ]]; then
+  export SAFETY_LOAD_SSH="$K8S_LOAD_NODE"
+  echo "[ramp] SAFETY_LOAD_SSH=$SAFETY_LOAD_SSH (k8s-qa node for load only)." >&2
+else
+  export SAFETY_LOAD_SSH="kspld0"
+  echo "[ramp] SAFETY_LOAD_SSH=kspld0 (default k8s node; set safety_load_ssh in $RAMP_CONFIG to override)." >&2
 fi
 # Tee to a log file so you can 'see logs' when something doesn't work.
 mkdir -p "$SCRIPT_DIR/results"

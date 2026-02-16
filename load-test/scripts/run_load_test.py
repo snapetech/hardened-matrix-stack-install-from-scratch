@@ -13,6 +13,7 @@ import collections
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -73,6 +74,28 @@ def get_load1_ssh(remote: str) -> float | None:
     except Exception:
         pass
     return None
+
+
+def verify_ssh_load_source(remote: str) -> tuple[str | None, str | None, str | None]:
+    """Run one SSH to remote, return (hostname, full_loadavg_line, stderr_or_none). So you can confirm which host we're reading load from."""
+    try:
+        out = subprocess.run(
+            [
+                "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", remote,
+                "hostname 2>/dev/null; cat /proc/loadavg",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if out.returncode != 0:
+            return None, None, (out.stderr or "").strip() or None
+        lines = (out.stdout or "").strip().split("\n")
+        hostname = lines[0].strip() if lines else None
+        loadavg_line = lines[1].strip() if len(lines) > 1 else None
+        return hostname, loadavg_line, None
+    except Exception as e:
+        return None, None, str(e)
 
 
 def _parse_proc_net_dev(content: str) -> tuple[int | None, int | None]:
@@ -275,11 +298,11 @@ spec:
               readOnly: true
           resources:
             requests:
-              memory: "256Mi"
-              cpu: "100m"
-            limits:
-              memory: "512Mi"
+              memory: "1Gi"
               cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
       volumes:
         - name: config
           configMap:
@@ -368,6 +391,37 @@ def _k8s_job_status_counts(namespace: str, job_name_prefix: str) -> tuple[int, i
         succeeded += st.get("succeeded", 0)
         failed += st.get("failed", 0)
     return active, succeeded, failed
+
+
+def _k8s_oom_pods(namespace: str, pod_prefix: str | None = None) -> list[str]:
+    """Return list of pod names that have OOMKilled in container lastState. Use pod_prefix to filter (e.g. 'loadtest-p-')."""
+    out = subprocess.run(
+        ["kubectl", "get", "pods", "-n", namespace, "-o", "json"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if out.returncode != 0:
+        return []
+    try:
+        data = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return []
+    oom_pods = []
+    for item in data.get("items", []):
+        name = item.get("metadata", {}).get("name", "")
+        if pod_prefix and not name.startswith(pod_prefix):
+            continue
+        for cs in item.get("status", {}).get("containerStatuses") or []:
+            if cs.get("lastState", {}).get("terminated", {}).get("reason") == "OOMKilled":
+                oom_pods.append(name)
+                break
+    return oom_pods
+
+
+def _k8s_oom_in_namespace(namespace: str, pod_prefix: str | None = None) -> bool:
+    """Return True if any pod (optionally with name starting with pod_prefix) has OOMKilled."""
+    return len(_k8s_oom_pods(namespace, pod_prefix)) > 0
 
 
 def _k8s_pod_counts(namespace: str, job_name_prefix: str) -> tuple[int, int, int, int]:
@@ -519,10 +573,20 @@ def _k8s_pod_log_tail(namespace: str, pod_name: str, tail: int = 2) -> str:
 
 
 def _extract_proof_from_log(log_text: str) -> str:
-    """Extract the most recent proof (cumulative video/audio frames) from participant log. Uses last match so p-0 shows higher count than p-9."""
+    """Extract the most recent proof (sent + received video/audio) from participant log. Uses last match so p-0 shows higher counts."""
     if not log_text or "proof:" not in log_text:
         return ""
-    # Match "proof: sent 692 video frames, 1463 audio frames" or "proof: total ..." — find ALL, use LAST (cumulative = latest is highest).
+    # New format: "proof: sent N video, M audio | received Rv video, Ra audio" or "proof: total sent ... | received ..."
+    # Find ALL proof lines, use LAST. Capture sent (v,a) and received (rv,ra).
+    all_m = re.findall(
+        r"proof:\s+(?:sent|total\s+sent)\s+(\d+)\s+video\s*,\s*(\d+)\s+audio\s*\|\s*received\s+(\d+)\s+video\s*,\s*(\d+)\s+audio",
+        log_text,
+        re.I,
+    )
+    if all_m:
+        v, a, rv, ra = all_m[-1]
+        return f"{v}v {a}a rx:{rv}v {ra}a"
+    # Fallback: sent-only format (legacy)
     all_m = re.findall(
         r"proof:\s+(?:sent|total)\s+(\d+)\s+video\s+frames?,?\s+(\d+)\s+audio", log_text, re.I
     )
@@ -578,6 +642,7 @@ def _write_ramp_metrics_summary(load_samples_path: Path, results_dir: Path) -> N
     out = {
         "duration_s": round(duration_s, 1) if duration_s else None,
         "load1_node": stats("load1_node"),
+        "load1_stack_node": stats("load1_stack_node"),
         "load1_local": stats("load1_local"),
         "server_latency_ms": stats("server_latency_ms"),
         "node_mem_available_mb": stats("node_mem_available_mb"),
@@ -586,6 +651,42 @@ def _write_ramp_metrics_summary(load_samples_path: Path, results_dir: Path) -> N
         "loadtest_cpu_m": stats("loadtest_cpu_m"),
         "loadtest_mem_mi": stats("loadtest_mem_mi"),
     }
+    # Per-participant load: CPU/mem from client pods only (correct). load1 = whole node so use incremental.
+    max_n = max((s.get("n") or s.get("jobs_created") or 0) for s in samples)
+    if max_n >= 1:
+        peak_samples = [s for s in samples if (s.get("n") or s.get("jobs_created") or 0) >= max(1, max_n - 1)]
+        cpu_per, mem_per = [], []
+        for s in peak_samples:
+            n = s.get("n") or s.get("jobs_created") or 1
+            if n < 1:
+                continue
+            if s.get("loadtest_cpu_m") is not None:
+                cpu_per.append(s["loadtest_cpu_m"] / n)
+            if s.get("loadtest_mem_mi") is not None:
+                mem_per.append(s["loadtest_mem_mi"] / n)
+        # CPU/mem: total client pod usage / n = true per-participant (kubectl top is clients only).
+        # load1_node is WHOLE NODE (stack + clients). So "load per user" must be incremental:
+        # (avg load at peak n - avg load at baseline n) / (peak_n - baseline_n).
+        load1_added_per_user = None
+        baseline_load1 = None
+        baseline_n = 1
+        baseline_samples = [s for s in samples if (s.get("n") or s.get("jobs_created") or 0) <= baseline_n]
+        if max_n > baseline_n and peak_samples and baseline_samples:
+            load1_at_peak = [s["load1_node"] for s in peak_samples if s.get("load1_node") is not None]
+            load1_at_baseline = [s["load1_node"] for s in baseline_samples if s.get("load1_node") is not None]
+            if load1_at_peak and load1_at_baseline:
+                avg_peak = sum(load1_at_peak) / len(load1_at_peak)
+                avg_baseline = sum(load1_at_baseline) / len(load1_at_baseline)
+                load1_added_per_user = round((avg_peak - avg_baseline) / (max_n - baseline_n), 2)
+                baseline_load1 = round(avg_baseline, 2)
+        out["peak_n"] = max_n
+        if baseline_load1 is not None:
+            out["baseline_load1_node"] = baseline_load1
+        out["per_participant"] = {
+            "cpu_m": round(sum(cpu_per) / len(cpu_per)) if cpu_per else None,
+            "mem_mi": round(sum(mem_per) / len(mem_per)) if mem_per else None,
+            "load1_added_per_user": load1_added_per_user,
+        }
     # Net I/O: first vs last cumulative bytes -> rate over duration
     if len(samples) >= 2 and duration_s and duration_s > 0:
         first, last = samples[0], samples[-1]
@@ -605,9 +706,27 @@ def _write_ramp_metrics_summary(load_samples_path: Path, results_dir: Path) -> N
         lat = out.get("server_latency_ms")
         if lat:
             print(f"  server_latency_ms: min={lat['min']} median={lat['median']} max={lat['max']}", file=sys.stderr)
-        ln, ll = out.get("load1_node"), out.get("load1_local")
-        if ln or ll:
-            print(f"  load1: node={ln} local={ll}", file=sys.stderr)
+        ln, lstack, ll = out.get("load1_node"), out.get("load1_stack_node"), out.get("load1_local")
+        if ln or lstack or ll:
+            parts = [f"node={ln}", f"local={ll}"]
+            if lstack is not None:
+                parts.insert(1, f"stack_node={lstack}")
+            print(f"  load1: " + " ".join(parts), file=sys.stderr)
+        per = out.get("per_participant")
+        if per and out.get("peak_n"):
+            pn = out["peak_n"]
+            cpu = per.get("cpu_m")
+            mem = per.get("mem_mi")
+            load1_inc = per.get("load1_added_per_user")
+            parts = []
+            if cpu is not None:
+                parts.append(f"~{cpu} mCPU")
+            if mem is not None:
+                parts.append(f"~{mem} Mi")
+            if load1_inc is not None:
+                parts.append(f"~{load1_inc} load1 added per user")
+            if parts:
+                print(f"  per participant (at peak n={pn}): " + ", ".join(parts) + ". Scale: (load1_max - baseline_load1) / load1_added_per_user.", file=sys.stderr)
         # Sanity: did client load actually increase over the ramp? (early vs late loadtest_cpu_m)
         try:
             if load_samples_path.exists():
@@ -838,7 +957,11 @@ def _k8s_dump_job_logs(
         if not quiet:
             print(msg, file=sys.stderr)
     if seen_401_get_token:
-        msg = "\n>>> Early exit + 401/get_token: ensure lk-jwt can reach OpenID userinfo (nginx .well-known m.server and /_matrix/federation/v1/openid/userinfo on 443/8448 with TLS). Restart lk-jwt after nginx changes."
+        msg = (
+            "\n>>> Early exit + 401/get_token: lk-jwt must reach OpenID userinfo (nginx .well-known/matrix/server and "
+            "/_matrix/federation/v1/openid/userinfo on 443/8448). Check: kubectl logs -n matrix-qa -l app=lk-jwt --tail=100. "
+            "Ensure run-ramp-k8s.sh patched lk-jwt hostAliases to current nginx ClusterIP and rollout completed."
+        )
         lines.append(msg)
         if not quiet:
             print(msg, file=sys.stderr)
@@ -891,9 +1014,9 @@ def _run_k8s_participants(
     namespace = getattr(args, "k8s_namespace", "matrix-qa") or "matrix-qa"
     image = getattr(args, "k8s_image", "load-test-participant:latest") or "load-test-participant:latest"
     image_pull_policy = getattr(args, "k8s_image_pull_policy", None) or None
-    # When using preload (imagePullPolicy Never), pin pods to the node we preloaded on so they see the image
-    safety_ssh = (os.environ.get("SAFETY_LOAD_SSH") or (config.get("safety") or {}).get("safety_load_ssh") or "").strip()
-    node_name = (safety_ssh.split("@")[-1] if safety_ssh and image_pull_policy else None) or None
+    # Load must be read from the k8s node (where pods run). Never use timeways.net / prod.
+    # Optional: pin loadtest pods to a specific cluster node via safety.k8s_loadtest_node_name.
+    node_name = (config.get("safety") or {}).get("k8s_loadtest_node_name") or None
     job_prefix = "loadtest-p-"
 
     k8s_config = _k8s_in_cluster_config(config, namespace)
@@ -910,13 +1033,63 @@ def _run_k8s_participants(
     consecutive_errors_max = safety_cfg.get("consecutive_errors_max", 5)
     prometheus_url = (os.environ.get("PROMETHEUS_URL") or safety_cfg.get("prometheus_url") or "").strip()
     safety_load_ssh = (os.environ.get("SAFETY_LOAD_SSH") or safety_cfg.get("safety_load_ssh") or "").strip() or None
+    # K8s-qa only: load must be from the k8s node. Never use timeways.net (prod).
+    if safety_load_ssh and "timeways" in safety_load_ssh.lower():
+        k8s_node = (safety_cfg.get("safety_load_ssh") or "kspld0").strip() or "kspld0"
+        print(f"[k8s] Load must come from the k8s-qa node only. Overriding {safety_load_ssh!r} -> {k8s_node!r}.", file=sys.stderr)
+        safety_load_ssh = k8s_node
     prometheus_load1_query = (os.environ.get("PROMETHEUS_LOAD1_QUERY") or safety_cfg.get("prometheus_load1_query") or "").strip() or None
-    # When participants run in k8s, load must come from the node (SSH to node). localhost = orchestrator, not the pods.
-    # node_load1 = whole node (server stack + loadtest pods combined). We also pull stack vs loadtest pod CPU/mem separately.
+    # Three loads: orchestrator_host (this machine / general system), client_node (pods), stack_node (Synapse/QA server).
+    # - safety_load_ssh = node where LOADTEST PODS run → client_node.
+    # - stack_load_ssh = optional node where STACK (Synapse, LiveKit) runs → stack_node. When unset, stack_on_orchestrator can set stack_node = orchestrator_host.
+    stack_load_ssh = (safety_cfg.get("stack_load_ssh") or "").strip() or None
+    stack_on_orchestrator = bool(safety_cfg.get("stack_on_orchestrator"))
+    if stack_load_ssh and safety_load_ssh and stack_load_ssh.strip().lower() == safety_load_ssh.strip().lower():
+        stack_load_ssh = None  # same as pods node, no need to measure twice
     load_source = (safety_load_ssh or "localhost (orchestrator)").strip()
     if not safety_load_ssh or safety_load_ssh.strip().lower() == "localhost":
-        print("[k8s] WARNING: Set SAFETY_LOAD_SSH to your k8s node (e.g. user@<node-ip>) so load reflects the node running the pods. Currently measuring orchestrator/localhost.", file=sys.stderr)
-    print(f"[k8s ramp-up] Load source: {load_source}. Metrics: node_load1=whole node (server+clients); stack vs loadtest pods reported separately.", file=sys.stderr)
+        print("[k8s] WARNING: Set SAFETY_LOAD_SSH to the node where loadtest pods run. Currently measuring orchestrator/localhost.", file=sys.stderr)
+    else:
+        ssh_hostname, ssh_loadavg, ssh_err = verify_ssh_load_source(safety_load_ssh)
+        local_hostname = None
+        try:
+            local_hostname = socket.gethostname()
+        except Exception:
+            pass
+        if ssh_err:
+            print(f"[k8s] SSH load verification failed (client node): {ssh_err}. Load readings may be wrong or missing.", file=sys.stderr)
+        elif ssh_hostname is not None and ssh_loadavg is not None:
+            load1_from_verify = ssh_loadavg.split()[0] if ssh_loadavg.split() else "?"
+            print(
+                f"[k8s] client_node (QA client pods): hostname={ssh_hostname!r} loadavg={ssh_loadavg!r} (1m={load1_from_verify}). "
+                f"orchestrator_host (this machine)={local_hostname!r}.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"[k8s] Could not get hostname/loadavg from client node {safety_load_ssh}. Check ssh {safety_load_ssh} 'hostname; cat /proc/loadavg'.", file=sys.stderr)
+    # Detect when orchestrator and client node are the same host.
+    orchestrator_same_as_pods = False
+    if local_hostname and ssh_hostname:
+        lo = (local_hostname or "").strip().lower().split(".")[0]
+        sh = (ssh_hostname or "").strip().lower().split(".")[0]
+        orchestrator_same_as_pods = lo == sh
+    if orchestrator_same_as_pods:
+        print(
+            "[k8s] One host: we show host_load once (whole machine) and in-pod CPU/mem for stack_pods (Synapse, etc.) vs client_pods (loadtest) from kubectl top.",
+            file=sys.stderr,
+        )
+    if stack_load_ssh:
+        sh, sl, se = verify_ssh_load_source(stack_load_ssh)
+        if se:
+            print(f"[k8s] stack_node (Synapse/QA server): verification failed: {se}. Will still try to read each tick.", file=sys.stderr)
+        elif sh and sl:
+            print(f"[k8s] stack_node (Synapse/QA server): hostname={sh!r} loadavg={sl!r}.", file=sys.stderr)
+    elif stack_on_orchestrator:
+        print("[k8s] stack_node = orchestrator_host (Synapse/QA server runs on this machine).", file=sys.stderr)
+    print(
+        "[k8s ramp-up] One host: host_load + stack_pods (Synapse/etc. CPU+mem) + client_pods (loadtest CPU+mem). Multi-host: host loadavg + same pod metrics.",
+        file=sys.stderr,
+    )
 
     if ramp_up and min_p is not None and max_p is not None and step_dur is not None:
         total_duration = (max_p - min_p + 1) * step_dur
@@ -971,14 +1144,21 @@ def _run_k8s_participants(
                         next_to_start += 1  # skip so we don't retry every second
             node_mem_mb = None
             node_net_rx = node_net_tx = None
+            load1_stack_node = None
             if safety_load_ssh:
                 load1, node_mem_mb, node_net_rx, node_net_tx = get_node_stats_ssh(safety_load_ssh)
                 source = "ssh" if load1 is not None else "none"
             else:
                 load1, source = get_load1(prometheus_url, safety_load_ssh, load1_query=prometheus_load1_query)
+            local_load1 = get_load1_proc()  # orchestrator host (general system)
+            if stack_load_ssh:
+                load1_stack_node = get_load1_ssh(stack_load_ssh)
+            elif stack_on_orchestrator and local_load1 is not None:
+                load1_stack_node = local_load1  # Synapse runs on orchestrator host
+            else:
+                load1_stack_node = None
             server_status, server_latency_sec = get_server_latency((config.get("server_url") or "").strip())
             server_latency_ms = int(server_latency_sec * 1000) if server_latency_sec is not None else None
-            local_load1 = get_load1_proc()
             local_net_rx, local_net_tx = get_net_io_proc()
             # Job status is source of truth (active/succeeded/failed); pod list for running vs pending
             active, job_succeeded, job_failed = _k8s_job_status_counts(namespace, job_prefix)
@@ -986,6 +1166,17 @@ def _run_k8s_participants(
             jobs_created = next_to_start
             if load1 is not None:
                 load_window.append(load1)
+            # Fail fast: first OOM or first job failure. Don't run the whole ramp.
+            oom_pods = _k8s_oom_pods(namespace, pod_prefix=job_prefix)
+            if oom_pods:
+                print(f"[ramp] FAIL: OOM kill on pod(s): {oom_pods}. Exiting immediately. See results/job_logs.txt", file=sys.stderr)
+                _k8s_dump_job_logs(namespace, job_prefix, list(range(jobs_created)), tail=100, log_file=load_test_dir / "results" / "job_logs.txt")
+                return 1
+            # First failure and zero successes → exit now (don't add more participants or wait for full ramp).
+            if jobs_created >= 1 and job_failed >= 1 and job_succeeded == 0:
+                print(f"[ramp] FAIL: first participant failed ({job_failed} failed, 0 succeeded). Exiting immediately. Fix 401/OOM then re-run. See results/job_logs.txt", file=sys.stderr)
+                _k8s_dump_job_logs(namespace, job_prefix, list(range(jobs_created)), tail=150, log_file=load_test_dir / "results" / "job_logs.txt")
+                return 1
             # Fail fast when CLIENTS never appear (0 running): 15s = no pods at all; 20s = pods didn't come up.
             NO_RUNNING_GRACE_SEC = 20
             job_logs_path = load_test_dir / "results" / "job_logs.txt"
@@ -1035,6 +1226,7 @@ def _run_k8s_participants(
                 sample = {
                     "t": round(elapsed, 1),
                     "load1_node": load1,
+                    "load1_stack_node": load1_stack_node,
                     "load1_local": local_load1,
                     "source": source,
                     "node_mem_available_mb": node_mem_mb,
@@ -1060,13 +1252,32 @@ def _run_k8s_participants(
                     lf.write(json.dumps(sample) + "\n")
             except OSError:
                 pass
-            # Print every second: concurrent jobs/pods + load (always show so we never appear "stuck" with no output).
+            # Print every second. One host: show host load once + in-pod CPU/mem for stack (Synapse etc.) vs clients (loadtest pods).
+            # Containers don't have loadavg; we use kubectl top pod CPU/mem for stack vs clients.
             reported = max(load_window) if load_window else (load1 if load1 is not None else 0.0)
-            local_str = f" local_load1={local_load1:.2f}" if local_load1 is not None else " local_load1=n/a"
+            load_str = ""
+            if orchestrator_same_as_pods:
+                # One host (e.g. kspld0): host load once, then stack pods CPU/mem and client pods CPU/mem (in-pod metrics).
+                if local_load1 is not None:
+                    load_str += f" host_load={local_load1:.2f}"
+                load_str += f" | stack_pods {stack_cpu_m}m {stack_mem_mi}Mi | client_pods {loadtest_cpu_m}m {loadtest_mem_mi}Mi"
+            else:
+                # Multiple hosts: orchestrator_host, client_node, stack_node (host loadavg per host).
+                if local_load1 is not None:
+                    load_str += f" orchestrator_host={local_load1:.2f}"
+                if load1 is not None:
+                    load_str += f" client_node={reported:.2f}"
+                if load1_stack_node is not None:
+                    load_str += f" stack_node={load1_stack_node:.2f}"
+                    total_load = (reported if load1 is not None else 0) + load1_stack_node
+                    if total_load > 0:
+                        load_str += f" total={total_load:.2f}"
+                load_str += f" | stack_pods {stack_cpu_m}m {stack_mem_mi}Mi | client_pods {loadtest_cpu_m}m {loadtest_mem_mi}Mi"
+            if not load_str.strip():
+                load_str = " load=n/a"
             mem_str = f" node_mem={node_mem_mb}MB" if node_mem_mb is not None else ""
             srv_str = f" server={server_status} {server_latency_ms}ms" if server_status is not None else ""
-            # Use actual running count for CLIENTS (kubectl top lags for new pods, so loadtest_pod_n can be 0 at 1r0p).
-            pod_str = f" | SERVER {stack_pod_n}p {stack_cpu_m}m {stack_mem_mi}Mi | CLIENTS {running}p {loadtest_cpu_m}m {loadtest_mem_mi}Mi"
+            pod_str = f" | SERVER {stack_pod_n}p | CLIENTS {running}p"
             # When waiting to add next participant, show countdown on same line every second so 1r0p doesn't look stuck.
             next_str = ""
             if next_to_start < max_p:
@@ -1102,7 +1313,7 @@ def _run_k8s_participants(
                 ramp_safety_triggered = True
                 break
             jobs_str = f"started={jobs_created} active={active} ok={job_succeeded} failed={job_failed} | pods={running}r{pending}p"
-            print(f"[safety] t={elapsed:.0f}s {jobs_str} | load1={reported:.2f} ({source}){local_str}{mem_str}{srv_str}{pod_str}{next_str} max={load1_max}", file=sys.stderr)
+            print(f"[safety] t={elapsed:.0f}s {jobs_str} |{load_str}{mem_str}{srv_str}{pod_str}{next_str} max={load1_max}", file=sys.stderr)
             if active < jobs_created and jobs_created > 1:
                 if not job_logs_dumped_for_early_exits:
                     job_logs_dumped_for_early_exits = True
@@ -1168,6 +1379,12 @@ def _run_k8s_participants(
         if joined_ok < total_started and total_started > 0:
             print(f"[result] {joined_ok}/{total_started} succeeded at ramp end. Job logs:", file=sys.stderr)
             _k8s_dump_job_logs(namespace, job_prefix, list(range(total_started)), tail=100, log_file=load_test_dir / "results" / "job_logs.txt")
+            oom_list = _k8s_oom_pods(namespace, pod_prefix=job_prefix)
+            if oom_list:
+                print(
+                    f"[result] RUN INVALID: OOM on pod(s): {oom_list}. Raise participant memory (run_load_test.py Job resources) or quota (k8s-qa/00-budget.yaml).",
+                    file=sys.stderr,
+                )
         _k8s_delete_jobs(namespace, job_prefix)
         # Skip the long wait block below; we already have result and deleted jobs.
         ramp_done_result = (joined_ok, total_started)

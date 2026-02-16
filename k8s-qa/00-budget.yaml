@@ -1,11 +1,5 @@
-# Optional: apply when running k8s-qa on a 1 vCPU / 1 GiB node (e.g. minikube --cpus=1 --memory=1024mb).
-# Ensures the stack cannot exceed the budget; prevents "forgot to set resources" from OOMing the node.
-# limits.cpu 10000m: base stack ~4300m; headroom for rollouts + 10 loadtest (100m request, 500m limit each).
-# run-ramp-k8s.sh uses limits.cpu headroom to compute Max participants: (limit - used - 100m buffer) / 100m.
-# requests.cpu 3000m: stack requests + 10×100m participants + buffer.
-# requests.memory / limits.memory: stack ~1273Mi/2488Mi; 10 loadtest @ 256Mi/512Mi; 10Gi limit.
-# Apply first: kubectl apply -f k8s-qa/00-budget.yaml
-# Then deploy the rest. Verify: kubectl describe quota -n matrix-qa
+# 16c/32 hyperthread. 20 loadtest @ 2c limit = 40c (oversubscribes 32 to drive load). Stack ~5c. Quota 48c.
+# run-ramp-k8s: (limit - used - 500m) / 2000m = max participants. Participant limit 2c so load test drives CPU.
 ---
 apiVersion: v1
 kind: ResourceQuota
@@ -15,10 +9,10 @@ metadata:
 spec:
   hard:
     pods: "30"
-    requests.cpu: "3000m"
-    requests.memory: "6Gi"
-    limits.cpu: "10000m"
-    limits.memory: "10Gi"
+    requests.cpu: "15000m"
+    requests.memory: "24Gi"
+    limits.cpu: "48000m"
+    limits.memory: "96Gi"
 ---
 apiVersion: v1
 kind: LimitRange

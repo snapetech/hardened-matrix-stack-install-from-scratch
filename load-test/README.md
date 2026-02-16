@@ -65,6 +65,17 @@ On constrained **clusters or VPS** (the stack under test), use fewer participant
 - `--participants 2` or `3`, `--duration 60` or `120`
 - The scripts use 320×240 @ 15 fps video and synthetic audio; for even lighter load, you can reduce resolution/fps in `participant.py` or run LiveKit’s own `lk load-test` with `--video-resolution low --no-simulcast` (see docs/SMALL-CLUSTER.md).
 
+## Scaling and capacity (what the tests tell you)
+
+After a k8s ramp (e.g. 1→10), the run prints and writes **per-participant load** so you know how much each user adds:
+
+- **results/ramp_metrics_summary.json** — `per_participant`: `cpu_m` (millicores), `mem_mi` (MiB), `load1_added_per_user` (incremental node load per additional user); and `peak_n` (max participants in the run). The console also prints a line like: `per participant (at peak n=10): ~170 mCPU, ~90 Mi, ~0.4 load1 added per user. Scale: node load1 hits load1_max or quota.`
+- **How far you can scale:** In practice you’re limited by (1) **node load1** — ramp until `load1` hits `safety.load1_max` (e.g. 20), then approximate max users ≈ `(load1_max - baseline_load1_node) / load1_added_per_user`; (2) **k8s ResourceQuota** — namespace CPU/memory limit (see `k8s-qa/00-budget.yaml` and the “Max participants from quota” line at ramp start); (3) **OOM or scheduler** — if pods stay Pending or get OOMKilled, increase quota or add nodes.
+
+These numbers are for the **test profile** (480p24 A/V, one Matrix message per 15s). Heavier clients (higher res, more messages) will add more load per user.
+
+**Why load1 may not look linear:** Node load1 is a 1-minute exponential average, so it lags real CPU and can jump (e.g. spike around 10–12 participants) or dip near ramp end. Use the per-participant `load1_added_per_user` and peak-n summary for capacity planning; plot `load_ramp.jsonl` (load1 vs `n` or `t`) to inspect actual shape.
+
 ## Safety
 
 - If `safety.load1_max` is set and Prometheus (or SSH /proc/loadavg when prometheus_url empty) returns load1 above it, the orchestrator writes a stop signal and all participants disconnect; exit code 2.
@@ -84,6 +95,8 @@ For structured load ramps (e.g. 1c/1g validation): run Tier 1 (LiveKit SDK) and 
 - **RX validation:** When N > 1, each participant must be **receiving** at least one remote audio track and one remote video track (subscribed from another participant) within 30s of publishing; otherwise the run fails. Solo (N = 1) runs skip this check.
 
 So each participant is under both **TX** (sending A/V + text) and **RX** (receiving others’ A/V) load. Load (e.g. staying under 2.0 with 7+ participants) reflects real media and chat load, not idle connections.
+
+**Proof of received:** The ramp prints per-participant proof lines (e.g. `p-0 4493v 9474a rx:38000v 80000a`) showing **sent** and **received** frame counts. Longest-running participants (e.g. p-0) should show the **highest cumulative received** (most time in call); each extra peer adds (N−1) inbound A/V streams, so received counts scale with both duration and participant count.
 
 **Client metrics (429s, latency):** When the orchestrator sets `LOADTEST_METRICS_DIR` (it does for local runs), each participant writes `.participant_metrics_<index>.json` on exit with per-operation events: `matrix_join`, `openid_token`, `livekit_token`, `livekit_connect`, and the first `matrix_send`. Each event has `status`, `429_count`, and `latency_ms`. Use these to see server 429s and client-observed RTT/latency.
 
@@ -127,7 +140,7 @@ Output: `results/summary.csv` with columns `n`, `mode`, `join_success_rate`, `pe
 
 You can run the **participants** (test bots) as Jobs inside the same cluster as the Matrix stack. That removes the port-forward bottleneck and gives real in-cluster load.
 
-**Load when using k8s participants:** The harness runs on your machine; participants run as pods. So **load must be read from the k8s node** (where the pods run), not localhost. Set `SAFETY_LOAD_SSH` to the node (e.g. `user@<node-ip>` or the node hostname) so we SSH to the node and read `/proc/loadavg` there. Otherwise you'll see orchestrator/localhost load (low and unrelated to 6+ clients). In config, set `safety.safety_load_ssh` to the node, or `export SAFETY_LOAD_SSH=user@node` before running.
+**Load when using k8s participants:** We report **load1_node** = the node where loadtest pods run (SSH to `safety_load_ssh` → `/proc/loadavg`). **load1_local** = orchestrator machine. When the orchestrator runs on the same host as the pods, those two match; when it runs elsewhere, they differ. So **load for the host running the pods** is load1_node; we do not report a separate “server” load unless the stack runs on a different node. Set `safety.safety_load_ssh` to the node where the **pods** run. If the **stack** (Synapse, LiveKit, etc.) runs on a different node, set `safety.stack_load_ssh` to that node so we report **load1_stack_node** as well (then load for the k8s-qa server host and load for the host running the pods are distinct). At ramp start we print which hostname each load comes from. When orchestrator and pods node are the **same host**, we show one **host_load** with “1 node: harness+pods+stack” (that load includes Synapse when the stack runs there). When different, we show **orchestrator=**, **client_node=**, **stack_node=** (if set), and **total** / fractions. **401/get_token:** Check `kubectl logs -n matrix-qa -l app=lk-jwt --tail=100`; run-ramp-k8s patches lk-jwt to nginx so OpenID userinfo is reachable. **OOM:** Raise participant memory or quota (k8s-qa/00-budget.yaml) if runs are invalid.
 
 1. **Build the participant image** (from repo root or `load-test/`):
    ```bash
@@ -148,6 +161,15 @@ You can run the **participants** (test bots) as Jobs inside the same cluster as 
    ```bash
    .venv/bin/python3 scripts/run_load_test.py --config config-ramp-qa.yaml --no-create-users --participants 10 --duration 120 --k8s-participants --k8s-namespace matrix-qa
    ```
+
+### Quick reference (k8s ramp)
+
+- **1→20 ramp, 9s step, 1080p:** Set `video_resolution: "1080p"` in `config-ramp-qa.yaml`, then:
+  ```bash
+  ./run-ramp-k8s.sh   # or: .venv/bin/python3 scripts/ramp_harness.py --config config-ramp-qa.yaml --min 1 --max 20 --step-duration-min 9 --single-pass --skip-tier2 --k8s-participants --namespace matrix-qa
+  ```
+- **Results:** `results/ramp.log`, `results/load_ramp.jsonl`, `results/ramp_metrics_summary.json`, `results/job_logs.txt` (if jobs exit early).
+- **Last ramp verdict:** `python3 scripts/show_ramp_verdict.py` (run from `load-test/`).
 
 ## Optional: evaluate metrics
 
