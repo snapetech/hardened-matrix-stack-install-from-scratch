@@ -65,6 +65,10 @@ def run_tier1_ramp_up(
     step_duration: int,
     config: dict,
     start_stagger: float = 0.1,
+    k8s_participants: bool = False,
+    k8s_namespace: str = "matrix-qa",
+    k8s_image: str = "load-test-participant:latest",
+    k8s_image_pull_policy: str | None = None,
 ) -> tuple[int, float]:
     """Run run_load_test.py --ramp-up: single pass, add participants over time. Returns (exit_code, duration_sec)."""
     start = time.monotonic()
@@ -85,6 +89,10 @@ def run_tier1_ramp_up(
         "--step-duration", str(step_duration),
         "--start-stagger", str(start_stagger),
     ]
+    if k8s_participants:
+        cmd += ["--k8s-participants", "--k8s-namespace", k8s_namespace, "--k8s-image", k8s_image]
+        if k8s_image_pull_policy:
+            cmd += ["--k8s-image-pull-policy", k8s_image_pull_policy]
     rc = subprocess.call(cmd, cwd=load_test_dir, env=env)
     elapsed = time.monotonic() - start
     return rc, elapsed
@@ -172,7 +180,16 @@ def main() -> int:
     parser.add_argument("--room-url", help="Element Call room URL for Tier 2 (required if not --skip-tier2)")
     parser.add_argument("--namespace", default="matrix-qa", help="K8s namespace for metrics sampler")
     parser.add_argument("--results-dir", default="results", help="Output directory for metrics and summary")
+    parser.add_argument("--k8s-participants", action="store_true", help="Run participants as k8s Jobs (in-cluster; no port-forward)")
+    parser.add_argument("--k8s-image", default="load-test-participant:latest", help="Participant image when using --k8s-participants")
+    parser.add_argument("--k8s-image-pull-policy", default=None, help="e.g. Never when image pre-loaded on node")
+    parser.add_argument("--step-duration-min", type=int, default=20, help="Min seconds between adding each participant (default 20; use 10 for faster ramp)")
+    parser.add_argument("--safety-interval", type=float, default=1.0, help="Seconds between safety/load checks (default 1)")
+    parser.add_argument("--ramp-fast", action="store_true", help="Faster ramp: step-duration-min=10, safety-interval=1")
     args = parser.parse_args()
+    if getattr(args, "ramp_fast", False):
+        args.step_duration_min = 10
+        args.safety_interval = 1.0
 
     script_dir = Path(__file__).resolve().parent
     load_test_dir = script_dir.parent
@@ -205,7 +222,7 @@ def main() -> int:
 
     if args.single_pass:
         # Single run: ramp up from min to max (add participants over time), one metrics stream
-        step_duration = max(15, args.tier1_duration // (args.max - args.min + 1))
+        step_duration = max(getattr(args, "step_duration_min", 20), args.tier1_duration // (args.max - args.min + 1))
         total_duration_approx = (args.max - args.min + 1) * step_duration
         print(f"\n--- Single-pass ramp {args.min} -> {args.max} (step={step_duration}s, ~{total_duration_approx}s total) ---", file=sys.stderr)
         metrics_path = results_dir / "metrics_ramp.jsonl"
@@ -232,6 +249,10 @@ def main() -> int:
             script_dir, load_test_dir, str(config_path),
             args.min, args.max, step_duration, config,
             start_stagger=getattr(args, "start_stagger", 0.1),
+            k8s_participants=getattr(args, "k8s_participants", False),
+            k8s_namespace=args.namespace,
+            k8s_image=getattr(args, "k8s_image", "load-test-participant:latest"),
+            k8s_image_pull_policy=getattr(args, "k8s_image_pull_policy", None),
         )
         if sampler_proc:
             sampler_proc.send_signal(signal.SIGINT)

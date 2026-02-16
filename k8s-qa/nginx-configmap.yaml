@@ -39,8 +39,19 @@ data:
           return 200 "{\"m.homeserver\":{\"base_url\":\"http://$host/\"}}";
         }
 
+        # Allow OpenID userinfo for lk-jwt token validation; block rest of federation
+        location = /_matrix/federation/v1/openid/userinfo {
+          proxy_pass http://synapse:8008;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_http_version 1.1;
+        }
         location /_matrix/federation { return 403; }
-        location = /.well-known/matrix/server { return 404; }
+        location = /.well-known/matrix/server {
+          default_type application/json;
+          return 200 "{\"m.server\":\"qa.local:8448\"}";
+        }
 
         location ~ ^/_synapse/admin {
           proxy_pass http://synapse:8008;
@@ -105,5 +116,27 @@ data:
           return 200 'OK';
           add_header Content-Type text/plain;
         }
+      }
+
+      # HTTPS 443 + 8448: .well-known and OpenID userinfo for lk-jwt (gomatrixserverlib may try 443 or 8448).
+      # Cert from secret nginx-tls-qa (create with ./nginx-tls-secret-qa.sh).
+      server {
+        listen 443 ssl;
+        listen 8448 ssl;
+        server_name _;
+        ssl_certificate     /etc/nginx/ssl/tls.crt;
+        ssl_certificate_key /etc/nginx/ssl/tls.key;
+        location = /.well-known/matrix/server {
+          default_type application/json;
+          return 200 "{\"m.server\":\"qa.local:8448\"}";
+        }
+        location = /_matrix/federation/v1/openid/userinfo {
+          proxy_pass http://synapse:8008;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_http_version 1.1;
+        }
+        location / { return 403; }
       }
     }

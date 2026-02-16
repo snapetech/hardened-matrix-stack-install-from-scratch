@@ -22,10 +22,17 @@ spec:
           ports:
             - containerPort: 80
               name: http
+            - containerPort: 443
+              name: https
+            - containerPort: 8448
+              name: federation
           volumeMounts:
             - name: config
               mountPath: /etc/nginx/nginx.conf
               subPath: nginx.conf
+              readOnly: true
+            - name: tls
+              mountPath: /etc/nginx/ssl
               readOnly: true
           readinessProbe:
             httpGet:
@@ -35,15 +42,18 @@ spec:
             periodSeconds: 5
           resources:
             requests:
-              memory: "25Mi"
+              memory: "48Mi"
               cpu: "10m"
             limits:
-              memory: "50Mi"
+              memory: "128Mi"
               cpu: "50m"
       volumes:
         - name: config
           configMap:
             name: nginx-config
+        - name: tls
+          secret:
+            secretName: nginx-tls-qa
 ---
 apiVersion: v1
 kind: Service
@@ -59,3 +69,9 @@ spec:
       targetPort: 80
       nodePort: 30048
       name: http
+    - port: 443
+      targetPort: 443
+      name: https
+    - port: 8448
+      targetPort: 8448
+      name: federation

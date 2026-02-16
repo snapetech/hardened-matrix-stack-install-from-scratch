@@ -1,0 +1,12 @@
+.venv
+__pycache__
+*.pyc
+.env
+config.yaml
+config-*.yaml
+test_users.json
+test_room_id.txt
+.load_test_result.json
+.safety_triggered
+results/
+*.jsonl

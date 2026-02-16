@@ -11,3 +11,6 @@ duration_seconds: 120
 safety:
   load1_max: 20
   consecutive_errors_max: 10
+  # Server load via SSH /proc/loadavg (no Prometheus). Must be the k8s node where participant pods run.
+  # Use hostname if SSH works (e.g. in ~/.ssh/config), or user@hostname / user@node-ip. Override with SAFETY_LOAD_SSH env.
+  safety_load_ssh: "kspld0"

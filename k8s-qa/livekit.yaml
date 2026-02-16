@@ -98,13 +98,15 @@ spec:
       nodePort: 30050
       name: http
 ---
+# lk-jwt: scaled for concurrent load (e.g. 20 participants hitting /get_token at once).
+# Multiple replicas + higher CPU/memory so token issuance + OpenID validation don't time out.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: lk-jwt
   namespace: matrix-qa
 spec:
-  replicas: 1
+  replicas: 4
   selector:
     matchLabels:
       app: lk-jwt
@@ -114,8 +116,8 @@ spec:
         app: lk-jwt
     spec:
       # lk-jwt must reach LiveKit in-cluster (ws://livekit:7880). For OpenID validation
-      # it looks up the Matrix server by name (qa.local); make qa.local resolve to nginx
-      # so .well-known and API calls hit our proxy. (Replace with your nginx ClusterIP if different.)
+      # it looks up the Matrix server by name (qa.local); qa.local must resolve to nginx.
+      # run-ramp-k8s.sh patches hostAliases to the current nginx ClusterIP each run.
       hostAliases:
         - ip: "10.43.101.44"
           hostnames:
@@ -123,6 +125,7 @@ spec:
       containers:
         - name: lk-jwt
           image: ghcr.io/element-hq/lk-jwt-service:latest
+          imagePullPolicy: IfNotPresent
           env:
             - name: LIVEKIT_JWT_PORT
               value: "6080"
@@ -146,8 +149,8 @@ spec:
             - containerPort: 6080
           resources:
             requests:
-              memory: "25Mi"
-              cpu: "10m"
+              memory: "80Mi"
+              cpu: "75m"
             limits:
-              memory: "50Mi"
-              cpu: "50m"
+              memory: "160Mi"
+              cpu: "250m"

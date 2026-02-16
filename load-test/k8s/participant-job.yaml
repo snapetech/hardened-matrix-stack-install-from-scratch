@@ -1,0 +1,47 @@
+# Template for one load-test participant. Generated/parameterized by run_load_test.py --k8s-participants.
+# One Job per participant; apply with JOB_NAME, USER_INDEX, DURATION, IMAGE, NAMESPACE set.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loadtest-p-0
+  namespace: matrix-qa
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: participant
+          image: load-test-participant:latest
+          workingDir: /app
+          command:
+            - python3
+            - /app/scripts/participant.py
+            - --config
+            - /config/config.yaml
+            - --user-index
+            - "0"
+            - --duration
+            - "300"
+          env:
+            - name: TEST_ROOM_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: load-test-room
+                  key: test_room_id
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: users
+              mountPath: /secrets
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: load-test-config
+        - name: users
+          secret:
+            secretName: load-test-users

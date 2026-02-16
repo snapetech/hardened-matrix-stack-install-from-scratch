@@ -29,41 +29,57 @@ LOADTEST_SENTENCES = [
 
 
 def _put_with_429_retry(url: str, *, headers=None, json_data=None, timeout=15) -> requests.Response:
-    """PUT once or retry after 429 using retry_after_ms."""
+    r, _ = _put_with_429_retry_counted(url, headers=headers, json_data=json_data, timeout=timeout)
+    return r
+
+
+def _put_with_429_retry_counted(url: str, *, headers=None, json_data=None, timeout=15) -> tuple[requests.Response, int]:
+    """PUT with 429 retry; returns (response, number of 429s received)."""
+    n_429 = 0
     total_waited = 0.0
     for _ in range(MAX_429_RETRIES):
         r = requests.put(url, headers=headers or {}, json=json_data, timeout=timeout)
-        if r.status_code != 429:
-            return r
+        if r.status_code == 429:
+            n_429 += 1
+        else:
+            return r, n_429
         try:
             wait_ms = int(r.json().get("retry_after_ms", 5000))
         except Exception:
             wait_ms = 5000
         wait_sec = min(wait_ms / 1000.0, MAX_429_WAIT_SEC - total_waited)
         if wait_sec <= 0:
-            return r
+            return r, n_429
         time.sleep(wait_sec)
         total_waited += wait_sec
-    return r
+    return r, n_429
 
 
 def _post_with_429_retry(url: str, *, headers=None, json_data=None, timeout=15) -> requests.Response:
-    """POST once or retry after 429 using retry_after_ms."""
+    r, _ = _post_with_429_retry_counted(url, headers=headers, json_data=json_data, timeout=timeout)
+    return r
+
+
+def _post_with_429_retry_counted(url: str, *, headers=None, json_data=None, timeout=15) -> tuple[requests.Response, int]:
+    """POST with 429 retry; returns (response, number of 429s received)."""
+    n_429 = 0
     total_waited = 0.0
     for _ in range(MAX_429_RETRIES):
         r = requests.post(url, headers=headers or {}, json=json_data, timeout=timeout)
-        if r.status_code != 429:
-            return r
+        if r.status_code == 429:
+            n_429 += 1
+        else:
+            return r, n_429
         try:
             wait_ms = int(r.json().get("retry_after_ms", 5000))
         except Exception:
             wait_ms = 5000
         wait_sec = min(wait_ms / 1000.0, MAX_429_WAIT_SEC - total_waited)
         if wait_sec <= 0:
-            return r
+            return r, n_429
         time.sleep(wait_sec)
         total_waited += wait_sec
-    return r
+    return r, n_429
 
 # Add parent so we can import fake_media
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -76,38 +92,47 @@ except ImportError:
     rtc = None  # type: ignore
 
 
-def matrix_join_room(server_url: str, access_token: str, room_id: str) -> None:
-    """Join a Matrix room (e.g. after invite). Retries on 429."""
-    r = _post_with_429_retry(
+def matrix_join_room(server_url: str, access_token: str, room_id: str, metrics_list: list | None = None) -> None:
+    """Join a Matrix room (e.g. after invite). Retries on 429. Optionally append to metrics_list."""
+    t0 = time.perf_counter()
+    r, n_429 = _post_with_429_retry_counted(
         urljoin(server_url, f"/_matrix/client/v3/rooms/{room_id}/join"),
         headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
         json_data={},
         timeout=15,
     )
+    if metrics_list is not None:
+        metrics_list.append({"op": "matrix_join", "status": r.status_code, "429_count": n_429, "latency_ms": round((time.perf_counter() - t0) * 1000, 2)})
     r.raise_for_status()
 
 
-def get_openid_token(server_url: str, access_token: str, user_id: str) -> dict:
+def get_openid_token(server_url: str, access_token: str, user_id: str, metrics_list: list | None = None) -> dict:
     """Request OpenID token from Matrix (for lk-jwt-service). Retries on 429."""
-    r = _post_with_429_retry(
+    t0 = time.perf_counter()
+    r, n_429 = _post_with_429_retry_counted(
         urljoin(server_url, f"/_matrix/client/v3/user/{user_id}/openid/request_token"),
         headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
         json_data={},
         timeout=15,
     )
+    if metrics_list is not None:
+        metrics_list.append({"op": "openid_token", "status": r.status_code, "429_count": n_429, "latency_ms": round((time.perf_counter() - t0) * 1000, 2)})
     r.raise_for_status()
     return r.json()
 
 
-def matrix_send_message(server_url: str, access_token: str, room_id: str, body: str, txn_id: str) -> None:
+def matrix_send_message(server_url: str, access_token: str, room_id: str, body: str, txn_id: str, metrics_list: list | None = None) -> None:
     """Send one m.room.message to the room. Retries on 429."""
     url = urljoin(server_url, f"/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}")
-    r = _put_with_429_retry(
+    t0 = time.perf_counter()
+    r, n_429 = _put_with_429_retry_counted(
         url,
         headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
         json_data={"msgtype": "m.text", "body": body},
         timeout=15,
     )
+    if metrics_list is not None:
+        metrics_list.append({"op": "matrix_send", "status": r.status_code, "429_count": n_429, "latency_ms": round((time.perf_counter() - t0) * 1000, 2)})
     r.raise_for_status()
 
 
@@ -119,6 +144,7 @@ def get_livekit_token(
     server_name: str,
     device_id: str,
     member_id: str,
+    metrics_list: list | None = None,
 ) -> str:
     """Exchange OpenID token for LiveKit JWT via lk-jwt-service (POST /get_token, SFURequest body)."""
     # lk-jwt-service exposes /get_token; nginx proxies /livekit/jwt/ -> upstream, so we need .../livekit/jwt/get_token
@@ -139,10 +165,44 @@ def get_livekit_token(
             "claimed_device_id": device_id,
         },
     }
-    r = _post_with_429_retry(url, headers={"Content-Type": "application/json"}, json_data=body, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("JWT") or data.get("jwt") or data.get("participant_token") or data.get("token") or str(data)
+    # Retry on timeout and 401 so burst of N clients can all get tokens (lk-jwt may queue or openid may be briefly unavailable)
+    last_err = None
+    total_429 = 0
+    t0 = time.perf_counter()
+    max_attempts = 5
+    backoff_sec = 3
+    for attempt in range(max_attempts):
+        try:
+            r, n_429 = _post_with_429_retry_counted(
+                url, headers={"Content-Type": "application/json"}, json_data=body, timeout=30
+            )
+            total_429 += n_429
+            if r.status_code == 401 and attempt < max_attempts - 1:
+                time.sleep(backoff_sec)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            token = data.get("JWT") or data.get("jwt") or data.get("participant_token") or data.get("token") or str(data)
+            if metrics_list is not None:
+                metrics_list.append({"op": "livekit_token", "status": r.status_code, "429_count": total_429, "latency_ms": round((time.perf_counter() - t0) * 1000, 2)})
+            return token
+        except (requests.exceptions.Timeout, requests.exceptions.ReadTimeout) as e:
+            last_err = e
+            if attempt < max_attempts - 1:
+                time.sleep(backoff_sec)
+            else:
+                if metrics_list is not None:
+                    metrics_list.append({"op": "livekit_token", "status": -1, "429_count": total_429, "latency_ms": round((time.perf_counter() - t0) * 1000, 2), "error": "timeout"})
+                raise
+        except requests.exceptions.HTTPError as e:
+            last_err = e
+            if e.response is not None and e.response.status_code == 401 and attempt < max_attempts - 1:
+                time.sleep(backoff_sec)
+                continue
+            raise
+    if last_err:
+        raise last_err
+    raise RuntimeError("get_livekit_token failed")
 
 
 async def run_participant(
@@ -155,29 +215,35 @@ async def run_participant(
     access_token: str,
     duration_seconds: float,
     safety_triggered: callable,
+    metrics_list: list | None = None,
 ) -> None:
     if rtc is None:
         raise RuntimeError("livekit package not installed")
 
     # 1) Join Matrix room (accept invite)
-    matrix_join_room(server_url, access_token, room_id)
+    matrix_join_room(server_url, access_token, room_id, metrics_list)
 
     # 2) OpenID token from Matrix
-    openid_resp = get_openid_token(server_url, access_token, user_id)
+    openid_resp = get_openid_token(server_url, access_token, user_id, metrics_list)
     if not (openid_resp.get("access_token") or openid_resp.get("token")):
         raise ValueError(f"No OpenID token in response: {openid_resp}")
 
     # 3) LiveKit JWT from lk-jwt-service (POST /get_token with SFURequest body)
     device_id = "LOADTEST"
     member_id = f"loadtest-{user_id}"
-    lk_token = get_livekit_token(livekit_jwt_url, openid_resp, room_id, user_id, server_name, device_id, member_id)
+    lk_token = get_livekit_token(livekit_jwt_url, openid_resp, room_id, user_id, server_name, device_id, member_id, metrics_list)
 
     # 4) Connect to LiveKit
     room = rtc.Room()
+    t0_connect = time.perf_counter()
     try:
         await room.connect(livekit_ws_url, lk_token)
     except Exception as e:
+        if metrics_list is not None:
+            metrics_list.append({"op": "livekit_connect", "status": -1, "latency_ms": round((time.perf_counter() - t0_connect) * 1000, 2), "error": str(e)})
         raise RuntimeError(f"LiveKit connect failed: {e}") from e
+    if metrics_list is not None:
+        metrics_list.append({"op": "livekit_connect", "status": 0, "latency_ms": round((time.perf_counter() - t0_connect) * 1000, 2)})
 
     # 5) Create sources and tracks
     audio_source = rtc.AudioSource(SAMPLE_RATE, 1)
@@ -215,27 +281,39 @@ async def run_participant(
             break
         await asyncio.sleep(rx_interval)
         elapsed += rx_interval
+    # For concurrent load test we must not exit early: stay in call for full duration.
+    # Log RX result but do not disconnect/raise so all participants keep running until test ends.
     if room.remote_participants and not (has_audio and has_video):
-        await room.disconnect()
-        raise RuntimeError(
-            f"RX validation failed: after {rx_timeout}s no remote A/V received "
-            "(need both subscribed audio and video from remotes)"
+        print(
+            f"RX validation: no remote A/V after {rx_timeout}s (continuing for duration anyway)",
+            file=sys.stderr,
         )
+        if metrics_list is not None:
+            metrics_list.append({"op": "rx_validation", "passed": False, "elapsed_s": rx_timeout})
+    elif room.remote_participants and metrics_list is not None:
+        metrics_list.append({"op": "rx_validation", "passed": True, "elapsed_s": round(elapsed, 1)})
 
     # 6) Matrix text: one sentence every 15s (run sync HTTP in executor)
     message_index = [0]  # mutable so closure can update
+    record_first_send = [True]  # record latency/429 for first send only
 
     def send_one_message():
         idx = message_index[0] % len(LOADTEST_SENTENCES)
         message_index[0] += 1
         body = LOADTEST_SENTENCES[idx]
         txn_id = f"loadtest-{user_id}-{int(time.time() * 1000)}"
-        matrix_send_message(server_url, access_token, room_id, body, txn_id)
+        mlist = metrics_list if (record_first_send and record_first_send[0]) else None
+        matrix_send_message(server_url, access_token, room_id, body, txn_id, mlist)
+        if record_first_send and record_first_send[0]:
+            record_first_send[0] = False
 
     async def text_loop():
         loop = asyncio.get_event_loop()
         while not safety_triggered():
             await loop.run_in_executor(None, send_one_message)
+            # One line per 15s so harness sample_log shows activity (A/V + Matrix).
+            t_sec = message_index[0] * 15
+            print(f"progress t={t_sec}s A/V+Matrix", file=sys.stderr)
             for _ in range(150):  # 15s in 0.1s steps so we can check safety
                 if safety_triggered():
                     return
@@ -324,17 +402,30 @@ def main() -> int:
         print("Error: test_room_id not set and test_room_id.txt not found", file=sys.stderr)
         return 1
 
-    asyncio.run(run_participant(
-        server_url=server_url,
-        server_name=server_name,
-        livekit_ws_url=livekit_ws_url,
-        livekit_jwt_url=livekit_jwt_url,
-        room_id=room_id,
-        user_id=u["user_id"],
-        access_token=u["access_token"],
-        duration_seconds=args.duration,
-        safety_triggered=safety_triggered,
-    ))
+    metrics_dir = os.environ.get("LOADTEST_METRICS_DIR")
+    metrics_list = [] if metrics_dir else None
+
+    try:
+        asyncio.run(run_participant(
+            server_url=server_url,
+            server_name=server_name,
+            livekit_ws_url=livekit_ws_url,
+            livekit_jwt_url=livekit_jwt_url,
+            room_id=room_id,
+            user_id=u["user_id"],
+            access_token=u["access_token"],
+            duration_seconds=args.duration,
+            safety_triggered=safety_triggered,
+            metrics_list=metrics_list,
+        ))
+    finally:
+        if metrics_dir and metrics_list is not None:
+            out_path = os.path.join(metrics_dir, f".participant_metrics_{args.user_index}.json")
+            try:
+                with open(out_path, "w") as f:
+                    json.dump({"user_index": args.user_index, "events": metrics_list}, f, indent=0)
+            except OSError:
+                pass
     return 0
 
 

@@ -5,6 +5,7 @@ load-test/test_users.json
 load-test/test_users_qa_e2e.json
 load-test/config-qa-e2e.yaml
 load-test/.load_test_result.json
+load-test/.participant_metrics_*.json
 load-test/results/
 load-test/.safety_triggered
 load-test/*.txt
