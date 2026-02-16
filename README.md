@@ -114,10 +114,10 @@ See **[k8s-qa/README.md](k8s-qa/README.md)** for deploy options (minimal vs full
 
 For long-running or one-off remote commands (e.g. load test, deploys), use **screen** so you can attach and monitor. Sudo still uses `run-remote-sudo.sh` (one shot, no retries).
 
-- **Non-sudo:** `./run-remote-in-screen.sh lukano@timeways.net <session_name> [-w] -- <command>`  
+- **Non-sudo:** `./run-remote-in-screen.sh user@texample.com <session_name> [-w] -- <command>`  
   Or pipe a script: `cat script.sh | ./run-remote-in-screen.sh lukano@timeways.net <session_name> [-w]`  
-  Attach: `ssh lukano@timeways.net` then `screen -r <session_name>`. With `-w`, the script waits for the screen to exit then runs `screen -wipe`.
-- **Sudo (once, no retries):** `./run-remote-sudo.sh lukano@timeways.net script.sh`
+  Attach: `ssh user@texample.com` then `screen -r <session_name>`. With `-w`, the script waits for the screen to exit then runs `screen -wipe`.
+- **Sudo (once, no retries):** `./run-remote-sudo.sh user@texample.com script.sh`
 - **Post-quantum SSH (fix "store now, decrypt later" warning):** `cat fix-openssh-pq-remote.sh | ./run-remote-sudo.sh user@host` — enables PQ key exchange on the server so new connections no longer warn.
 
 ## License
