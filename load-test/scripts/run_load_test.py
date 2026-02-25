@@ -499,8 +499,9 @@ _STACK_POD_PREFIXES = ("nginx-", "synapse-", "lk-jwt-", "livekit-", "postgres-")
 _LOADTEST_POD_PREFIX = "loadtest-p-"
 
 
-def _k8s_pod_top_split(namespace: str) -> tuple[int, int, int, int, int, int]:
-    """kubectl top pods; split into stack (server) vs loadtest (clients). Returns (stack_cpu_m, stack_mem_mi, stack_n, loadtest_cpu_m, loadtest_mem_mi, loadtest_n)."""
+def _k8s_pod_top_split(namespace: str) -> tuple[int, int, int, int, int, int, int, int]:
+    """kubectl top pods; split into stack (server) vs loadtest (clients); synapse separately.
+    Returns (stack_cpu_m, stack_mem_mi, stack_n, loadtest_cpu_m, loadtest_mem_mi, loadtest_n, synapse_cpu_m, synapse_mem_mi)."""
     try:
         out = subprocess.run(
             ["kubectl", "top", "pods", "-n", namespace, "--no-headers"],
@@ -509,10 +510,11 @@ def _k8s_pod_top_split(namespace: str) -> tuple[int, int, int, int, int, int]:
             timeout=12,
         )
         if out.returncode != 0 or not out.stdout:
-            return 0, 0, 0, 0, 0, 0
+            return 0, 0, 0, 0, 0, 0, 0, 0
     except Exception:
-        return 0, 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0, 0, 0
     stack_cpu = stack_mem = stack_n = 0
+    synapse_cpu = synapse_mem = 0
     loadtest_cpu = loadtest_mem = loadtest_n = 0
     for line in out.stdout.strip().split("\n"):
         if not line or len(line.split()) < 3:
@@ -522,9 +524,11 @@ def _k8s_pod_top_split(namespace: str) -> tuple[int, int, int, int, int, int]:
         if name.startswith(_LOADTEST_POD_PREFIX):
             bucket_cpu, bucket_mem, bucket_n = loadtest_cpu, loadtest_mem, loadtest_n
             is_loadtest = True
+            is_synapse = False
         elif any(name.startswith(p) for p in _STACK_POD_PREFIXES):
             bucket_cpu, bucket_mem, bucket_n = stack_cpu, stack_mem, stack_n
             is_loadtest = False
+            is_synapse = name.startswith("synapse-")
         else:
             continue
         try:
@@ -547,9 +551,12 @@ def _k8s_pod_top_split(namespace: str) -> tuple[int, int, int, int, int, int]:
                 loadtest_cpu, loadtest_mem, loadtest_n = bucket_cpu, bucket_mem, bucket_n
             else:
                 stack_cpu, stack_mem, stack_n = bucket_cpu, bucket_mem, bucket_n
+                if is_synapse:
+                    synapse_cpu += c
+                    synapse_mem += m
         except (ValueError, IndexError):
             pass
-    return stack_cpu, stack_mem, stack_n, loadtest_cpu, loadtest_mem, loadtest_n
+    return stack_cpu, stack_mem, stack_n, loadtest_cpu, loadtest_mem, loadtest_n, synapse_cpu, synapse_mem
 
 
 def _k8s_pod_log_tail(namespace: str, pod_name: str, tail: int = 2) -> str:
@@ -648,11 +655,28 @@ def _write_ramp_metrics_summary(load_samples_path: Path, results_dir: Path) -> N
         "node_mem_available_mb": stats("node_mem_available_mb"),
         "stack_cpu_m": stats("stack_cpu_m"),
         "stack_mem_mi": stats("stack_mem_mi"),
-        "loadtest_cpu_m": stats("loadtest_cpu_m"),
-        "loadtest_mem_mi": stats("loadtest_mem_mi"),
+        "synapse_cpu_m": stats("synapse_cpu_m"),
+        "synapse_mem_mi": stats("synapse_mem_mi"),
     }
-    # Per-participant load: CPU/mem from client pods only (correct). load1 = whole node so use incremental.
+    # Server (stack) and Synapse-only by n=1..10 — so we can verify 1c/1g vs 4c/4g (Synapse should cap at 1000m in 1c).
     max_n = max((s.get("n") or s.get("jobs_created") or 0) for s in samples)
+    server_by_n = {}
+    for n in range(1, min(11, max_n + 1)):
+        at_n = [s for s in samples if (s.get("n") or s.get("jobs_created")) == n]
+        if not at_n:
+            continue
+        row = {}
+        for key in ("stack_cpu_m", "stack_mem_mi", "synapse_cpu_m", "synapse_mem_mi"):
+            vals = [s[key] for s in at_n if s.get(key) is not None]
+            if vals:
+                vals = sorted(vals)
+                row[key] = round(vals[len(vals) // 2])
+        if row:
+            row["samples"] = len(at_n)
+            server_by_n[str(n)] = row
+    if server_by_n:
+        out["server_by_n"] = server_by_n
+    # Per-participant load: CPU/mem from client pods only (correct). load1 = whole node so use incremental.
     if max_n >= 1:
         peak_samples = [s for s in samples if (s.get("n") or s.get("jobs_created") or 0) >= max(1, max_n - 1)]
         cpu_per, mem_per = [], []
@@ -712,6 +736,14 @@ def _write_ramp_metrics_summary(load_samples_path: Path, results_dir: Path) -> N
             if lstack is not None:
                 parts.insert(1, f"stack_node={lstack}")
             print(f"  load1: " + " ".join(parts), file=sys.stderr)
+        syn_cpu, syn_mem = out.get("synapse_cpu_m"), out.get("synapse_mem_mi")
+        if syn_cpu or syn_mem:
+            sc = f"max={syn_cpu.get('max')} median={syn_cpu.get('median')}" if isinstance(syn_cpu, dict) else syn_cpu
+            sm = f"max={syn_mem.get('max')} median={syn_mem.get('median')}" if isinstance(syn_mem, dict) else syn_mem
+            print(f"  synapse (server only): cpu_m {sc}  mem_mi {sm}  (1c/1g: synapse max should cap at 1000m)", file=sys.stderr)
+        sbn = out.get("server_by_n")
+        if sbn and any("synapse_cpu_m" in (sbn.get(k) or {}) for k in sbn):
+            print("  server_by_n (stack + synapse by n): see ramp_metrics_summary.json", file=sys.stderr)
         per = out.get("per_participant")
         if per and out.get("peak_n"):
             pn = out["peak_n"]
@@ -1095,6 +1127,20 @@ def _run_k8s_participants(
         total_duration = (max_p - min_p + 1) * step_dur
         start_time = time.monotonic()
         print(f"[k8s ramp-up] min={min_p} max={max_p} step={step_dur}s total={total_duration}s", file=sys.stderr)
+        # So we can verify 1c/1g vs 4c/4g: print Synapse deployment limits (actual applied config).
+        try:
+            r = subprocess.run(
+                ["kubectl", "get", "deployment", "synapse", "-n", namespace, "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"synapse\")].resources.limits}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                print(f"[k8s ramp-up] Synapse deployment limits (applied): {r.stdout.strip()}", file=sys.stderr)
+            else:
+                print("[k8s ramp-up] Synapse deployment limits: (could not read)", file=sys.stderr)
+        except Exception:
+            pass
         if min_p == max_p:
             print(f"[k8s ramp-up] min==max: no step adds; running {min_p} participants for {total_duration}s only.", file=sys.stderr)
         else:
@@ -1116,6 +1162,7 @@ def _run_k8s_participants(
         results_dir.mkdir(parents=True, exist_ok=True)
         load_samples_path = results_dir / "load_ramp.jsonl"
         stack_cpu_m = stack_mem_mi = stack_pod_n = 0
+        synapse_cpu_m = synapse_mem_mi = 0
         loadtest_cpu_m = loadtest_mem_mi = loadtest_pod_n = 0
         ramp_safety_triggered = False
         job_logs_dumped_for_early_exits = False
@@ -1221,7 +1268,7 @@ def _run_k8s_participants(
                     )
             # Refresh pod CPU/mem every 3s so we have recent server vs client split; use cached on every tick.
             if int(elapsed) % 3 == 0:
-                stack_cpu_m, stack_mem_mi, stack_pod_n, loadtest_cpu_m, loadtest_mem_mi, loadtest_pod_n = _k8s_pod_top_split(namespace)
+                stack_cpu_m, stack_mem_mi, stack_pod_n, loadtest_cpu_m, loadtest_mem_mi, loadtest_pod_n, synapse_cpu_m, synapse_mem_mi = _k8s_pod_top_split(namespace)
             try:
                 sample = {
                     "t": round(elapsed, 1),
@@ -1236,6 +1283,8 @@ def _run_k8s_participants(
                     "local_net_tx_bytes": local_net_tx,
                     "stack_cpu_m": stack_cpu_m,
                     "stack_mem_mi": stack_mem_mi,
+                    "synapse_cpu_m": synapse_cpu_m,
+                    "synapse_mem_mi": synapse_mem_mi,
                     "stack_pod_count": stack_pod_n,
                     "loadtest_cpu_m": loadtest_cpu_m,
                     "loadtest_mem_mi": loadtest_mem_mi,
@@ -1260,7 +1309,7 @@ def _run_k8s_participants(
                 # One host (e.g. kspld0): host load once, then stack pods CPU/mem and client pods CPU/mem (in-pod metrics).
                 if local_load1 is not None:
                     load_str += f" host_load={local_load1:.2f}"
-                load_str += f" | stack_pods {stack_cpu_m}m {stack_mem_mi}Mi | client_pods {loadtest_cpu_m}m {loadtest_mem_mi}Mi"
+                load_str += f" | stack_pods {stack_cpu_m}m {stack_mem_mi}Mi | synapse {synapse_cpu_m}m {synapse_mem_mi}Mi | client_pods {loadtest_cpu_m}m {loadtest_mem_mi}Mi"
             else:
                 # Multiple hosts: orchestrator_host, client_node, stack_node (host loadavg per host).
                 if local_load1 is not None:
@@ -1272,7 +1321,7 @@ def _run_k8s_participants(
                     total_load = (reported if load1 is not None else 0) + load1_stack_node
                     if total_load > 0:
                         load_str += f" total={total_load:.2f}"
-                load_str += f" | stack_pods {stack_cpu_m}m {stack_mem_mi}Mi | client_pods {loadtest_cpu_m}m {loadtest_mem_mi}Mi"
+                load_str += f" | stack_pods {stack_cpu_m}m {stack_mem_mi}Mi | synapse {synapse_cpu_m}m {synapse_mem_mi}Mi | client_pods {loadtest_cpu_m}m {loadtest_mem_mi}Mi"
             if not load_str.strip():
                 load_str = " load=n/a"
             mem_str = f" node_mem={node_mem_mb}MB" if node_mem_mb is not None else ""

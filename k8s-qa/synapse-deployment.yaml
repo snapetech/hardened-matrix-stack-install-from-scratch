@@ -22,6 +22,10 @@ spec:
       labels:
         app: synapse
     spec:
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
       initContainers:
         - name: generate
           image: matrixdotorg/synapse:v1.107.0

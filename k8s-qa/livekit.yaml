@@ -57,6 +57,10 @@ spec:
       labels:
         app: livekit
     spec:
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: livekit
           image: livekit/livekit-server:v1.9.4
@@ -115,6 +119,10 @@ spec:
       labels:
         app: lk-jwt
     spec:
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
       # lk-jwt must reach LiveKit in-cluster (ws://livekit:7880). For OpenID validation
       # it looks up the Matrix server by name (qa.local); qa.local must resolve to nginx.
       # run-ramp-k8s.sh patches hostAliases to the current nginx ClusterIP each run.

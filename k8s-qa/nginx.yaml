@@ -16,6 +16,10 @@ spec:
       labels:
         app: nginx
     spec:
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: nginx
           image: nginx:1.25-alpine

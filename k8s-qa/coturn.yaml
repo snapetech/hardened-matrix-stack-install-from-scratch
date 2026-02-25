@@ -43,6 +43,10 @@ spec:
       labels:
         app: coturn
     spec:
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: coturn
           image: coturn/coturn:4.8.0-alpine

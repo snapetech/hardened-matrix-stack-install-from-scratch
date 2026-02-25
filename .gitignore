@@ -20,3 +20,10 @@ k8s-qa/.env
 k8s-qa/secrets.env
 k8s-qa/*.secret.yaml
 k8s-qa/local-*.yaml
+
+# Agent CLI local config (per-user, do not commit)
+.claude/settings.local.json
+opencode.json
+.claude/
+.cursor/
+target/

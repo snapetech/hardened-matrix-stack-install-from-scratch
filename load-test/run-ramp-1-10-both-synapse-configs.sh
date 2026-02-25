@@ -14,9 +14,20 @@ if ! kubectl cluster-info >/dev/null 2>&1; then
   exit 1
 fi
 
+# Fail fast if node has disk pressure (pods will be evicted and ramp will fail).
+if kubectl get nodes -o jsonpath='{.items[*].status.conditions[?(@.type=="DiskPressure")].status}' 2>/dev/null | grep -q True; then
+  echo "ERROR: At least one node has DiskPressure. Pods will be evicted and the ramp will fail." >&2
+  echo "  On the k3s node: free disk so >10% is free (e.g. sudo pacman -Sc, or prune Docker/k3s images)." >&2
+  echo "  Or relax eviction: add to /etc/rancher/k3s/config.yaml:" >&2
+  echo '    kubelet-arg:' >&2
+  echo '    - "eviction-hard=memory.available<100Mi,nodefs.available<3%,nodefs.inodesFree<5%,imagefs.available<15%"' >&2
+  echo "  then: sudo systemctl restart k3s" >&2
+  exit 1
+fi
+
 echo "=== Synapse 1c/1g: apply and rollout ===" >&2
 kubectl apply -f "$K8S_QA_DIR/synapse-deployment.yaml" -n "$NS" 2>&1
-kubectl rollout status deployment/synapse -n "$NS" --timeout=90s 2>&1
+kubectl rollout status deployment/synapse -n "$NS" --timeout=180s 2>&1
 
 echo "" >&2
 echo "=== Ramp 1→10 with Synapse 1c/1g ===" >&2
@@ -30,7 +41,7 @@ echo "[saved] $RESULTS/ramp_1c1g/load_ramp.jsonl and ramp_metrics_summary.json" 
 echo "" >&2
 echo "=== Synapse 4c/4g: apply and rollout ===" >&2
 kubectl apply -f "$K8S_QA_DIR/synapse-deployment-4c4g.yaml" -n "$NS" 2>&1
-kubectl rollout status deployment/synapse -n "$NS" --timeout=90s 2>&1
+kubectl rollout status deployment/synapse -n "$NS" --timeout=180s 2>&1
 
 echo "" >&2
 echo "=== Ramp 1→10 with Synapse 4c/4g ===" >&2
