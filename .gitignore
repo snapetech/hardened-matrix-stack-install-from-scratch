@@ -27,3 +27,6 @@ opencode.json
 .claude/
 .cursor/
 target/
+
+# Local private denylist/config
+/.local/
