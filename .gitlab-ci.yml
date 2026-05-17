@@ -22,7 +22,7 @@ docker:load-test:
     - docker buildx use default
   script:
     - >
-      docker buildx build
+      docker buildx build --network host
       --file load-test/Dockerfile
       --tag "$LOAD_TEST_IMAGE_TAG"
       --tag "$LOAD_TEST_IMAGE_SHA_TAG"
