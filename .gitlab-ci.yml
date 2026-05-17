@@ -11,17 +11,12 @@ stages:
 
 variables:
   DOCKER_BUILDKIT: "1"
-  DOCKER_HOST: tcp://docker:2375
-  DOCKER_TLS_CERTDIR: ""
   LOAD_TEST_IMAGE_TAG: "$CI_REGISTRY_IMAGE/load-test:${CI_COMMIT_REF_SLUG}"
   LOAD_TEST_IMAGE_SHA_TAG: "$CI_REGISTRY_IMAGE/load-test:${CI_COMMIT_SHORT_SHA}"
 
 docker:load-test:
   stage: build
   image: docker:27.5.1
-  services:
-    - name: docker:27.5.1-dind
-      command: ["--mtu=1450"]
   before_script:
     - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
     - docker buildx create --use --name gitlab-builder
